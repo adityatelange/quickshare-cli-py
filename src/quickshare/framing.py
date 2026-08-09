@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import socket
 
+from quickshare import debug
+
 # Not part of the protocol spec -- our own guard against a malicious/corrupt
 # length prefix causing an oversized allocation. Same name and value as
 # grishka/NearDrop's SANE_FRAME_LENGTH (NearbyShare/NearbyConnection.swift).
@@ -22,6 +24,7 @@ def pack_frame(payload: bytes) -> bytes:
 
 
 def send_frame(sock: socket.socket, payload: bytes) -> None:
+    debug.trace("framing", f"-> frame ({len(payload)} bytes)")
     sock.sendall(pack_frame(payload))
 
 
@@ -40,5 +43,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 def recv_frame(sock: socket.socket) -> bytes:
     length = int.from_bytes(_recv_exact(sock, 4), "big")
     if length > MAX_FRAME_LENGTH:
+        debug.log("framing", f"rejecting oversized frame: {length} bytes > max {MAX_FRAME_LENGTH}")
         raise FrameError(f"frame length {length} exceeds max {MAX_FRAME_LENGTH}")
+    debug.trace("framing", f"<- frame ({length} bytes)")
     return _recv_exact(sock, length)

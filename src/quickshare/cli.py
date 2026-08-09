@@ -6,6 +6,19 @@ import sys
 from quickshare.mdns import default_device_name
 
 
+def _add_debug_arguments(sub_parser: argparse.ArgumentParser) -> None:
+    """--debug/--debug-trace are accepted on every subcommand rather than on
+    the top-level parser, so they can be typed after the subcommand
+    (`quickshare send file.txt --debug`), which is where a user reaching for
+    them mid-session will naturally put them."""
+    sub_parser.add_argument("--debug", action="store_true", help="Log the protocol frame sequence to stderr")
+    sub_parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="Even more verbose logging: per-chunk frames and key material on HMAC failure (do not paste publicly)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quickshare", description="Minimal Quick Share receiver for Linux")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -16,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     receive.add_argument("-i", "--iface", default=None, help="Network interface to advertise on, e.g. enp6s0 (default: auto-detect)")
     receive.add_argument("--yes", action="store_true", help="Auto-accept incoming transfers without prompting")
     receive.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
+    _add_debug_arguments(receive)
 
     send = sub.add_parser("send", help="Discover a nearby device and send it one or more files")
     send.add_argument("paths", nargs="+", help="File path(s) to send")
@@ -23,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("-i", "--iface", default=None, help="Network interface to use for discovery, e.g. enp6s0 (default: auto-detect)")
     send.add_argument("-t", "--target", default=None, metavar="HOST:PORT", help="Connect directly instead of discovering (skips the device picker)")
     send.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
+    _add_debug_arguments(send)
 
     return parser
 
@@ -36,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
             from quickshare import color
 
             color.disable()
+
+        from quickshare import debug
+
+        debug.configure_from_args(args.debug, args.debug_trace)
 
         from quickshare.server import run_receiver
 
@@ -51,6 +70,10 @@ def main(argv: list[str] | None = None) -> int:
             from quickshare import color
 
             color.disable()
+
+        from quickshare import debug
+
+        debug.configure_from_args(args.debug, args.debug_trace)
 
         from quickshare.send import run_sender
 

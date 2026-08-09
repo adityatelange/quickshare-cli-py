@@ -17,6 +17,7 @@ from __future__ import annotations
 import socket
 import sys
 import threading
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +25,7 @@ import ifaddr
 from tqdm import tqdm
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
-from quickshare import color, framing, mdns, ukey2
+from quickshare import color, debug, framing, mdns, ukey2
 from quickshare.proto import offline_wire_formats_pb2 as off_pb2
 from quickshare.receive import SENDER_CANCELED, IncomingFile, ReceiveSession, build_connection_response_accept
 from quickshare.secure_frame import SecureChannel
@@ -84,6 +85,7 @@ def _run_handshake(sock: socket.socket) -> tuple[SecureChannel, str]:
     connection_request_frame = _read_offline_frame_plaintext(sock)
     if connection_request_frame.v1.type != off_pb2.V1Frame.FrameType.CONNECTION_REQUEST:
         raise ukey2.Ukey2Error("expected ConnectionRequest as the first frame")
+    debug.log("server", "<- ConnectionRequest")
 
     client_init_bytes = framing.recv_frame(sock)
 
@@ -96,6 +98,7 @@ def _run_handshake(sock: socket.socket) -> tuple[SecureChannel, str]:
     result = ukey2.run_server_handshake(client_init_bytes, send_server_init, recv_client_finished)
 
     framing.send_frame(sock, build_connection_response_accept())
+    debug.log("server", "-> ConnectionResponse ACCEPT")
 
     # The phone also sends its own plaintext ConnectionResponse back to us at
     # this point (location.nearby.connections.V1Frame.CONNECTION_RESPONSE) --
@@ -108,6 +111,7 @@ def _run_handshake(sock: socket.socket) -> tuple[SecureChannel, str]:
         raise ukey2.Ukey2Error(
             f"expected peer ConnectionResponse, got frame type {peer_connection_response.v1.type}"
         )
+    debug.log("server", "<- peer ConnectionResponse, secure channel established")
 
     keys = result.keys
     channel = SecureChannel(
@@ -157,7 +161,8 @@ def _handle_connection(
             while True:
                 try:
                     secure_message_bytes = framing.recv_frame(sock)
-                except framing.FrameError:
+                except framing.FrameError as exc:
+                    debug.log("server", f"connection ended while reading: {exc}")
                     if session.files_by_payload_id:
                         session.discard_incomplete()
                         return TransferOutcome.SENDER_DISCONNECTED, None
@@ -189,6 +194,10 @@ class _Advertiser:
         # so the phone recognizes this machine as the same device each time
         # instead of listing a new one on every run.
         self._endpoint_id = mdns.stable_endpoint_id()
+
+    @property
+    def endpoint_id(self) -> bytes:
+        return self._endpoint_id
 
     def _build_service_info(self) -> ServiceInfo:
         instance_name = mdns.build_service_instance_name(self._endpoint_id)
@@ -323,6 +332,11 @@ def run_receiver(
 
     advertiser = _Advertiser(device_name=device_name, port=port, address=address)
     advertiser.start()
+    debug.log(
+        "server",
+        f"listening on {address}:{port}, endpoint_id={advertiser.endpoint_id.decode('ascii', 'replace')}, "
+        f"re-announcing every {REANNOUNCE_INTERVAL_SECONDS:.0f}s",
+    )
 
     print(color.cyan(f"Advertising as {device_name!r} on {address}:{port}, saving to {output_path}"), file=sys.stderr)
     print(color.cyan("Waiting for an incoming transfer (Ctrl+C to stop)..."), file=sys.stderr)
@@ -331,8 +345,10 @@ def run_receiver(
         while True:
             conn, peer_addr = listener.accept()
             print(f"Connection from {peer_addr[0]} (Ctrl+C cancels this transfer)", file=sys.stderr)
+            debug.log("server", f"accepted connection from {peer_addr[0]}:{peer_addr[1]}")
             try:
                 outcome, completed = _handle_connection(conn, output_path, auto_accept, on_offer, on_progress)
+                debug.log("server", f"connection finished, outcome={outcome}")
                 if isinstance(on_progress, _ReceiveProgressPrinter):
                     on_progress.reset()  # close any bar left open by a canceled/disconnected transfer
                 print(file=sys.stderr)  # end whatever progress line was mid-print
@@ -350,6 +366,10 @@ def run_receiver(
                     print(color.yellow("Sender canceled the transfer."), file=sys.stderr)
             except Exception as exc:
                 print(color.red(f"\nTransfer failed: {exc}"), file=sys.stderr)
+                # The message alone rarely says where a protocol failure came
+                # from; the traceback does, so surface it when debugging.
+                if debug.enabled():
+                    traceback.print_exc(file=sys.stderr)
             print(color.cyan("\nWaiting for the next incoming transfer (Ctrl+C to stop)..."), file=sys.stderr)
     except KeyboardInterrupt:
         print("\nStopping.", file=sys.stderr)

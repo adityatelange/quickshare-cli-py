@@ -36,13 +36,14 @@ import select
 import socket
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from tqdm import tqdm
 
-from quickshare import color, crypto, discover, framing, mdns, ukey2
+from quickshare import color, crypto, debug, discover, framing, mdns, ukey2
 from quickshare.proto import offline_wire_formats_pb2 as off_pb2
 from quickshare.proto import wire_format_pb2 as wf_pb2
 from quickshare.receive import (
@@ -303,8 +304,10 @@ def _wait_for_received_ack(sock: socket.socket, channel: SecureChannel, payload_
             if pt.payload_header.id != payload_id:
                 continue
             if pt.control_message.event == off_pb2.PayloadTransferFrame.ControlMessage.EventType.PAYLOAD_RECEIVED_ACK:
+                debug.log("send", f"<- PAYLOAD_RECEIVED_ACK payload_id={payload_id}")
                 return
     except framing.FrameError:
+        debug.log("send", "peer closed without PAYLOAD_RECEIVED_ACK (expected; not an error)")
         return
 
 
@@ -364,6 +367,7 @@ def send_files(
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     with sock:
+        debug.log("send", f"connecting to {address}:{port}")
         sock.connect((address, port))
         channel, pin = _run_client_handshake(sock, endpoint_id, endpoint_info)
         if on_pin:
@@ -381,10 +385,14 @@ def send_files(
         # build_paired_key_encryption_frame docstring).
         for frame_bytes in build_paired_key_encryption_frame():
             channel_send(frame_bytes)
+        debug.log("send", "-> PairedKeyEncryption")
         _recv_sharing_frame(sock, channel)  # peer's PairedKeyEncryptionFrame
+        debug.log("send", "<- PairedKeyEncryption")
         for frame_bytes in build_paired_key_result_frame():
             channel_send(frame_bytes)
+        debug.log("send", "-> PairedKeyResult (UNABLE)")
         _recv_sharing_frame(sock, channel)  # peer's PairedKeyResultFrame
+        debug.log("send", "<- PairedKeyResult")
 
         # Payload/attachment ids are int64s on the wire; derive them from
         # random bytes rather than a counter, matching the reference
@@ -400,8 +408,12 @@ def send_files(
 
         for frame_bytes in build_introduction_frame(files):
             channel_send(frame_bytes)
+        if debug.enabled():
+            for f in files:
+                debug.log("send", f"-> offering {f.path.name!r} ({f.path.stat().st_size} bytes, payload_id={f.payload_id})")
         response_bytes = _recv_sharing_frame(sock, channel)
         status = parse_connection_response(response_bytes)
+        debug.log("send", f"<- RESPONSE {wf_pb2.ConnectionResponseFrame.Status.Name(status)}")
 
         if status != wf_pb2.ConnectionResponseFrame.Status.ACCEPT:
             return status
@@ -412,10 +424,12 @@ def send_files(
         try:
             for f in files:
                 size = f.path.stat().st_size
+                debug.log("send", f"sending {f.path.name!r} ({size} bytes, payload_id={f.payload_id})")
                 with open(f.path, "rb") as fh:
                     offset = 0
                     while True:
                         if _check_receiver_canceled(sock, channel):
+                            debug.log("send", f"receiver canceled at offset {offset}")
                             return RECEIVER_CANCELED
                         chunk = fh.read(CHUNK_SIZE)
                         is_last = len(chunk) == 0
@@ -425,11 +439,17 @@ def send_files(
                                     f.payload_id, offset, chunk, total_size=size, file_name=f.path.name, is_last=is_last
                                 )
                             )
-                        except OSError:
+                        except OSError as exc:
                             # The receiver hung up mid-write without sending
                             # an explicit CONTROL cancel frame first -- treat
                             # a broken connection here the same as one.
+                            debug.log("send", f"write failed at offset {offset}: {exc}")
                             return RECEIVER_CANCELED
+                        debug.trace(
+                            "send",
+                            f"-> FILE chunk payload_id={f.payload_id} offset={offset} "
+                            f"len={len(chunk)}{' LAST' if is_last else ''}",
+                        )
                         offset += len(chunk)
                         sent_so_far += len(chunk)
                         # The empty LAST_CHUNK terminator carries no new bytes --
@@ -452,6 +472,7 @@ def send_files(
             # receive.py's cancel(), which sends the same PAYLOAD_CANCELED
             # control frame in the other direction. Best-effort: the receiver
             # may already be gone, in which case there's nothing to notify.
+            debug.log("send", f"user canceled, notifying receiver (payload_id={f.payload_id})")
             try:
                 channel_send(build_payload_canceled(f.payload_id))
             except OSError:
@@ -560,6 +581,7 @@ def run_sender(
 
             print(color.cyan(f"Looking for nearby devices ({_DISCOVERY_SECONDS:.0f}s)..."), file=sys.stderr)
             devices = discover.browse(_DISCOVERY_SECONDS, address_for_browse)
+            debug.log("send", f"discovery finished, {len(devices)} device(s) found")
             if not devices:
                 print(color.yellow("No devices found."), file=sys.stderr)
                 return 1
@@ -588,6 +610,8 @@ def run_sender(
         return 1
     except (OSError, SendError, ukey2.Ukey2Error) as exc:
         print(color.red(f"Send failed: {exc}"), file=sys.stderr)
+        if debug.enabled():
+            traceback.print_exc(file=sys.stderr)  # the message alone rarely says where it failed
         return 1
     finally:
         _print_send_progress.reset()  # close any bar left open by a canceled/failed transfer

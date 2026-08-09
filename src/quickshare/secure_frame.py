@@ -11,11 +11,9 @@ as a submodule).
 
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass, field
 
-from quickshare import crypto
+from quickshare import crypto, debug
 from quickshare.proto import device_to_device_messages_pb2 as d2d_pb2
 from quickshare.proto import securegcm_pb2
 from quickshare.proto import securemessage_pb2
@@ -68,7 +66,9 @@ class SecureChannel:
             header_and_body=header_and_body_bytes,
             signature=signature,
         )
-        return secure_message.SerializeToString()
+        serialized = secure_message.SerializeToString()
+        debug.trace("secure", f"-> SecureMessage seq={d2d_msg.sequence_number} ({len(serialized)} bytes, {len(frame_bytes)} plaintext)")
+        return serialized
 
     def decrypt(self, secure_message_bytes: bytes) -> bytes:
         """serialized SecureMessage -> inner frame_bytes. Verifies HMAC before decrypting."""
@@ -78,15 +78,12 @@ class SecureChannel:
         if not crypto.hmac_verify(
             self.recv_hmac_key, secure_message.header_and_body, secure_message.signature
         ):
-            if os.environ.get("QUICKSHARE_DEBUG"):
-                computed = crypto.hmac_sha256(self.recv_hmac_key, secure_message.header_and_body)
-                print(
-                    f"[debug] HMAC mismatch\n"
-                    f"  recv_hmac_key   = {self.recv_hmac_key.hex()}\n"
-                    f"  header_and_body = {secure_message.header_and_body.hex()[:120]}... ({len(secure_message.header_and_body)} bytes)\n"
-                    f"  got signature   = {secure_message.signature.hex()}\n"
-                    f"  computed hmac   = {computed.hex()}",
-                    file=sys.stderr,
+            if debug.enabled(debug.TRACE):
+                debug.log_hmac_mismatch(
+                    self.recv_hmac_key,
+                    secure_message.header_and_body,
+                    secure_message.signature,
+                    crypto.hmac_sha256(self.recv_hmac_key, secure_message.header_and_body),
                 )
             raise SecureFrameError("HMAC verification failed")
 
@@ -98,4 +95,9 @@ class SecureChannel:
         )
         d2d_msg = d2d_pb2.DeviceToDeviceMessage()
         d2d_msg.ParseFromString(plaintext)
+        debug.trace(
+            "secure",
+            f"<- SecureMessage seq={d2d_msg.sequence_number} "
+            f"({len(secure_message_bytes)} bytes, {len(d2d_msg.message)} plaintext)",
+        )
         return d2d_msg.message

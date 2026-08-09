@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
-from quickshare import crypto
+from quickshare import crypto, debug
 from quickshare.proto import securemessage_pb2
 from quickshare.proto import ukey_pb2
 
@@ -142,18 +142,23 @@ def run_server_handshake(
     send_server_init(raw_server_init_bytes) must write that exact frame to the socket.
     recv_client_finished() must return the raw next frame's bytes as read off the socket.
     """
+    debug.log_frame("ukey2", "<-", "ClientInit", len(client_init_bytes))
     client_init = parse_client_init(client_init_bytes)
     commitment = find_p256_commitment(client_init)
 
     priv, pub = crypto.generate_keypair()
     server_init_bytes = build_server_init(pub)
     send_server_init(server_init_bytes)
+    debug.log_frame("ukey2", "->", "ServerInit", len(server_init_bytes))
 
     client_finished_bytes = recv_client_finished()
+    debug.log_frame("ukey2", "<-", "ClientFinished", len(client_finished_bytes))
     client_pub = verify_client_finished(client_finished_bytes, commitment)
+    debug.log("ukey2", "cipher commitment verified, deriving D2D keys (server role)")
 
     shared_secret = crypto.ecdh_shared_secret(priv, client_pub)
     keys = crypto.derive_d2d_keys(shared_secret, client_init_bytes, server_init_bytes, is_server=True)
+    debug.log("ukey2", f"handshake complete, PIN {keys.pin}")
     return HandshakeResult(keys=keys)
 
 
@@ -233,12 +238,16 @@ def run_client_handshake(
     client_finished_bytes = build_client_finished(pub)
     client_init_bytes = build_client_init(pub, client_finished_bytes)
     send_client_init(client_init_bytes)
+    debug.log_frame("ukey2", "->", "ClientInit", len(client_init_bytes))
 
     server_init_bytes = recv_server_init()
+    debug.log_frame("ukey2", "<-", "ServerInit", len(server_init_bytes))
     server_pub = parse_server_init(server_init_bytes)
 
     send_client_finished(client_finished_bytes)
+    debug.log_frame("ukey2", "->", "ClientFinished", len(client_finished_bytes))
 
     shared_secret = crypto.ecdh_shared_secret(priv, server_pub)
     keys = crypto.derive_d2d_keys(shared_secret, client_init_bytes, server_init_bytes, is_server=False)
+    debug.log("ukey2", f"handshake complete, PIN {keys.pin}")
     return HandshakeResult(keys=keys)

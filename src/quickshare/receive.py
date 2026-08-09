@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from quickshare import crypto
+from quickshare import color, crypto, debug
 from quickshare.proto import offline_wire_formats_pb2 as off_pb2
 from quickshare.proto import wire_format_pb2 as wf_pb2
 from quickshare.secure_frame import SecureChannel
@@ -324,6 +324,10 @@ class ReceiveSession:
 
         if pt.packet_type == off_pb2.PayloadTransferFrame.PacketType.CONTROL:
             event = pt.control_message.event
+            debug.log(
+                "receive",
+                f"<- CONTROL {off_pb2.PayloadTransferFrame.ControlMessage.EventType.Name(event)} payload_id={header.id}",
+            )
             if event in (
                 off_pb2.PayloadTransferFrame.ControlMessage.EventType.PAYLOAD_CANCELED,
                 off_pb2.PayloadTransferFrame.ControlMessage.EventType.PAYLOAD_ERROR,
@@ -355,13 +359,23 @@ class ReceiveSession:
                 return None
             if chunk.body:
                 incoming.write_chunk(chunk.offset, chunk.body)
+                debug.trace(
+                    "receive",
+                    f"<- FILE chunk payload_id={header.id} offset={chunk.offset} "
+                    f"len={len(chunk.body)} ({incoming.bytes_written}/{incoming.size})",
+                )
                 if self.on_progress:
                     self.on_progress(incoming)
             if is_last or incoming.complete:
                 if incoming.complete:
                     incoming.finalize()
+                    debug.log("receive", f"payload_id={header.id} complete, finalized {incoming.dest_path}")
                 else:
                     incoming.close()
+                    debug.log(
+                        "receive",
+                        f"payload_id={header.id} ended early at {incoming.bytes_written}/{incoming.size} bytes",
+                    )
                 self.channel_send(self.channel.encrypt(build_payload_received_ack(header.id, incoming.bytes_written)))
                 if self._offer_accepted and all(f.complete for f in self.files_by_payload_id.values()):
                     return [f.dest_path for f in self.files_by_payload_id.values()]
@@ -371,22 +385,43 @@ class ReceiveSession:
         frame = wf_pb2.Frame()
         frame.ParseFromString(sharing_bytes)
 
+        debug.log_frame(
+            "receive",
+            "<-",
+            wf_pb2.V1Frame.FrameType.Name(frame.v1.type),
+            len(sharing_bytes),
+        )
+
         if frame.v1.type == wf_pb2.V1Frame.FrameType.PAIRED_KEY_ENCRYPTION:
             self._send_frames(build_paired_key_result_frame())
         elif frame.v1.type == wf_pb2.V1Frame.FrameType.INTRODUCTION:
             self._handle_introduction(frame.v1.introduction)
 
     def _handle_introduction(self, introduction: wf_pb2.IntroductionFrame) -> None:
+        if debug.enabled():
+            # meta.name is the sender's raw, unsanitized name -- run it
+            # through color.sanitize before it reaches the terminal, same as
+            # every other display path does (see color.sanitize's docstring).
+            for meta in introduction.file_metadata:
+                debug.log(
+                    "receive",
+                    f"offered {color.sanitize(meta.name)!r} "
+                    f"({meta.size} bytes, payload_id={meta.payload_id}, "
+                    f"type={wf_pb2.FileMetadata.Type.Name(meta.type)})",
+                )
+
         if self.on_offer is not None:
             accept = self.on_offer(list(introduction.file_metadata), self.pin)
         else:
             accept = self.auto_accept
 
         self._offer_accepted = accept
+        debug.log("receive", f"offer {'accepted' if accept else 'declined'}")
         if accept:
             for meta in introduction.file_metadata:
                 safe_name = sanitize_offered_name(meta.name) if meta.name else f"file-{meta.payload_id}"
                 dest = unique_destination(self.output_dir, safe_name)
+                debug.log("receive", f"writing payload_id={meta.payload_id} to {dest}")
                 incoming = IncomingFile(payload_id=meta.payload_id, name=safe_name, size=meta.size, dest_path=dest)
                 incoming.open()
                 self.files_by_payload_id[meta.payload_id] = incoming

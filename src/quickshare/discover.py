@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from zeroconf import IPVersion, ServiceBrowser, ServiceStateChange, Zeroconf
 
-from quickshare import mdns
+from quickshare import color, debug, mdns
 
 _MIN_SERVICE_NAME_BYTES = 8  # 1 (version+pcp) + 4 (endpoint_id) + 3 (service_id_hash)
 _VERSION_MASK = 0b111
@@ -163,6 +163,7 @@ def browse(duration_seconds: float, address: str | None = None) -> list[Discover
             return
         info = zeroconf.get_service_info(service_type, name, timeout=3000)
         if info is None or not info.addresses:
+            debug.log("discover", f"no usable service info for {name!r}")
             return
         instance_name = name[: -len("." + service_type)]
         try:
@@ -172,8 +173,19 @@ def browse(duration_seconds: float, address: str | None = None) -> list[Discover
                 socket.inet_ntoa(info.addresses[0]),
                 info.port,
             )
-        except DiscoverError:
-            return  # not a Quick Share endpoint we can parse -- skip silently
+        except DiscoverError as exc:
+            # Skipped silently in normal operation (one unparseable peer must
+            # not disrupt discovery of the rest), which makes "my phone never
+            # shows up" impossible to diagnose without this line.
+            debug.log("discover", f"skipping {name!r}: {exc}")
+            return
+        # device_name comes from the peer's advertisement -- sanitize before
+        # it reaches the terminal, as everywhere else it's displayed.
+        debug.log(
+            "discover",
+            f"found {color.sanitize(device.device_name)!r} at {device.address}:{device.port} "
+            f"(type={device.device_type.name})",
+        )
         found[device.endpoint_id] = device
 
     browser = ServiceBrowser(zeroconf, mdns.SERVICE_TYPE, handlers=[on_state_change])

@@ -96,12 +96,15 @@ progress bar as the file downloads.
 
 ```bash
 uv run quickshare receive [-o OUTPUT_DIR] [-n NAME] [-i IFACE] [--yes] [--no-color]
+                          [--debug] [--debug-trace]
 
   -o, --output-dir   Directory to save received files into (default: current directory)
   -n, --name         Device name to advertise (default: hostname)
   -i, --iface        Network interface to advertise on, e.g. enp6s0 (default: auto-detect)
   --yes              Auto-accept incoming transfers without prompting
   --no-color         Disable colored terminal output
+  --debug            Log the protocol frame sequence to stderr
+  --debug-trace      Even more verbose: per-chunk frames and key material on HMAC failure
 ```
 
 Files are staged as `<name>.part` while transferring and renamed to their
@@ -120,12 +123,48 @@ one shown on the receiving device, then accept the transfer there.
 
 ```bash
 uv run quickshare send PATH [PATH ...] [-n NAME] [-i IFACE] [-t HOST:PORT] [--no-color]
+                       [--debug] [--debug-trace]
 
   -n, --name         Device name to advertise as sender (default: hostname)
   -i, --iface        Network interface to use for discovery, e.g. enp6s0 (default: auto-detect)
   -t, --target       Connect directly to host:port instead of discovering (skips the picker)
   --no-color         Disable colored terminal output
+  --debug            Log the protocol frame sequence to stderr
+  --debug-trace      Even more verbose: per-chunk frames and key material on HMAC failure
 ```
+
+### Debug logging
+
+Quick Share failures tend to look like "the phone hung up and said nothing".
+`--debug` prints the protocol frame sequence to stderr so you can see how far
+the exchange actually got, timestamped and tagged with the module that
+emitted each line.
+
+`--debug` also un-silences the two places where problems are otherwise
+swallowed on purpose: mDNS advertisements that fail to parse (skipped
+silently during discovery so one bad peer can't disrupt the rest, which
+makes "my phone never appears in the list" hard to diagnose otherwise), and
+the traceback behind a `Transfer failed:` / `Send failed:` message.
+
+`--debug-trace` adds every wire frame, SecureMessage sequence number, and
+payload chunk. It is genuinely verbose (a few lines per 64 KiB of file), so
+reach for it when a transfer stalls partway rather than as a default.
+
+> **Note:** `--debug-trace` prints raw key material if HMAC verification
+> fails, since diagnosing a key-derivation mismatch requires comparing the
+> bytes on both ends. Don't paste that output into a public bug report.
+> Plain `--debug` never prints key material or file contents.
+
+Both levels can also be set via the environment, which is handy when
+`quickshare` is invoked by a script or another tool:
+
+```bash
+QUICKSHARE_DEBUG=1     quickshare receive   # same as --debug
+QUICKSHARE_DEBUG=trace quickshare receive   # same as --debug-trace
+```
+
+An explicit flag always wins over the environment variable. All debug output
+goes to stderr, so it never mixes into anything you pipe on stdout.
 
 ## How it works
 
@@ -210,6 +249,7 @@ src/quickshare/
   send.py         Sender-side connect/handshake/introduction/payload-send flow
   server.py       TCP server + mDNS registration glue, receive CLI entry point
   color.py        ANSI terminal color helpers
+  debug.py        opt-in protocol logging behind --debug/--debug-trace
   cli.py          argparse CLI
   proto/          generated protobuf bindings (see proto/*.proto for sources)
 
