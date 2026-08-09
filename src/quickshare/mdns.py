@@ -47,6 +47,13 @@ _INSTANCE_SERVICE_ID_HASH = _SERVICE_ID_DIGEST[:_INSTANCE_SERVICE_ID_HASH_LENGTH
 # connections/implementation/wifi_lan_service_info.h: kKeyEndpointInfo = "n"
 TXT_KEY_ENDPOINT_INFO = "n"
 
+# internal/platform/implementation/windows/wifi_lan_medium.cc: kDeviceIpv4 = "IPv4".
+# Read there as a fallback IP source on the discovery side when the OS-level
+# mDNS resolution (System.Devices.IPAddress) doesn't yield one -- confirmed
+# present (dotted-quad ASCII) in a live capture of a real Android phone's
+# advertisement, which our own advertisement was missing.
+TXT_KEY_IPV4 = "IPv4"
+
 # connections/implementation/client_proxy.cc: kEndpointIdChars, kEndpointIdLength = 4
 _ENDPOINT_ID_ALPHABET = string.ascii_uppercase + "1234567890"
 _ENDPOINT_ID_LENGTH = 4
@@ -70,8 +77,17 @@ class ShareTargetType(IntEnum):
 
 def _web_safe_base64_encode(data: bytes) -> str:
     """internal/platform/base64_utils.cc: Base64Utils::Encode ->
-    absl::WebSafeBase64Escape(bytes), single-argument overload, which pads."""
-    return base64.urlsafe_b64encode(data).decode("ascii")
+    absl::WebSafeBase64Escape(bytes), which does NOT pad.
+
+    The earlier revision of this function padded, on the mistaken belief that
+    absl's web-safe variant pads like the standard one. It doesn't -- and the
+    difference is visible on the wire from every real implementation (a
+    live-captured Android phone and the Packet app both emit unpadded values,
+    both for the service instance name and the TXT 'n' value). Android's own
+    parser tolerated our stray '=' padding, but a literal '=' inside a DNS
+    instance label is exactly the kind of thing a stricter stack (Windows)
+    can silently choke on."""
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
 def stable_endpoint_id() -> bytes:
@@ -91,15 +107,22 @@ def stable_endpoint_id() -> bytes:
 def build_service_instance_name(endpoint_id: bytes) -> str:
     """WifiLanServiceInfo::operator NsdServiceInfo() (wifi_lan_service_info.cc).
 
-    [1 byte: (version&0b111)<<5 | (pcp&0b11111)] + endpoint_id(4) + service_id_hash(3),
-    then base64(WebSafe, padded). We advertise with no UWB address and an
-    undefined WebRTC state, so neither of those optional trailing fields is
-    written (matching the real encoder, which only appends them when present).
+    [1 byte: (version&0b111)<<5 | (pcp&0b11111)] + endpoint_id(4) + service_id_hash(3)
+    + two trailing zero bytes, then base64(WebSafe, unpadded).
+
+    The two trailing zeros are the empty-UWB-address / WebRTC-state trailer.
+    An earlier revision omitted them ("only appended when present"), which
+    Android's parser accepted -- but every real advertiser writes them: a
+    live-captured Android phone and the Packet app both produce 10-byte
+    payloads (14 base64 chars ending 'AAA'). Windows' stricter
+    WifiLanServiceInfo parser is the consumer that cares: with the 8-byte
+    form, Windows resolved our records and reachability-probed us but never
+    listed the device.
     """
     if len(endpoint_id) != _ENDPOINT_ID_LENGTH:
         raise ValueError(f"endpoint_id must be exactly {_ENDPOINT_ID_LENGTH} bytes")
     version_and_pcp = ((WIFI_LAN_SERVICE_INFO_VERSION & 0b111) << 5) | (_PCP_P2P_POINT_TO_POINT & 0b11111)
-    payload = bytes([version_and_pcp]) + endpoint_id + _INSTANCE_SERVICE_ID_HASH
+    payload = bytes([version_and_pcp]) + endpoint_id + _INSTANCE_SERVICE_ID_HASH + b"\x00\x00"
     return _web_safe_base64_encode(payload)
 
 

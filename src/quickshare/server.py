@@ -32,6 +32,12 @@ from quickshare.secure_frame import SecureChannel
 
 REANNOUNCE_INTERVAL_SECONDS = 60.0
 
+# Extra re-announces right after startup -- see _reannounce_loop's docstring
+# for why a peer's very first (QU/unicast) query can get a reply that's
+# missing the mDNS cache-flush bit, and why a prompt real multicast broadcast
+# works around it.
+_STARTUP_REANNOUNCE_COUNT = 5
+_STARTUP_REANNOUNCE_INTERVAL_SECONDS = 2.0
 
 _VIRTUAL_IFACE_PREFIXES = ("vmnet", "docker", "br-", "veth", "virbr", "lo")
 
@@ -136,6 +142,7 @@ class TransferOutcome:
 
 def _handle_connection(
     sock: socket.socket,
+    peer_ip: str,
     output_dir: Path,
     auto_accept: bool,
     on_offer,
@@ -145,6 +152,13 @@ def _handle_connection(
     populated when outcome == TransferOutcome.COMPLETED."""
     with sock:
         channel, pin = _run_handshake(sock)
+        # Announced only now, after a real ConnectionRequest + UKEY2 handshake:
+        # Windows' discovery opens (and instantly drops) connections to us just
+        # to check reachability while merely LISTING devices, and printing
+        # "Connection from ..." for those made every probe look like a transfer
+        # attempt. A probe never gets past the first frame read above (see
+        # framing.ConnectionClosedImmediately and run_receiver's handling of it).
+        print(f"Connection from {peer_ip} (Ctrl+C cancels this transfer)", file=sys.stderr)
 
         session = ReceiveSession(
             channel=channel,
@@ -205,9 +219,24 @@ class _Advertiser:
         return ServiceInfo(
             type_=mdns.SERVICE_TYPE,
             name=f"{instance_name}.{mdns.SERVICE_TYPE}",
+            # A distinct host record, not the service instance name itself:
+            # internal/platform/implementation/windows/wifi_lan_mdns.cc builds
+            # the SRV target from the machine's own DNS hostname + ".local"
+            # (GetDnsHostName()), separately from the SRV owner/instance name,
+            # with an explicit comment that a real hostname is required "other-
+            # wise A/AAAA records cannot be resolved". zeroconf.ServiceInfo
+            # defaults `server` to the instance name when omitted, which made
+            # our SRV target and A record self-referential -- unlike every
+            # real implementation -- and lines up with a Windows Quick Share
+            # peer that resolves an IP:port (so the TCP connect lands correctly)
+            # but then aborts before sending any protocol bytes.
+            server=f"{socket.gethostname()}.local.",
             addresses=[socket.inet_aton(self._address)],
             port=self._port,
-            properties={mdns.TXT_KEY_ENDPOINT_INFO.encode(): txt_value},
+            properties={
+                mdns.TXT_KEY_ENDPOINT_INFO.encode(): txt_value,
+                mdns.TXT_KEY_IPV4.encode(): self._address.encode("ascii"),
+            },
         )
 
     def start(self) -> None:
@@ -217,6 +246,31 @@ class _Advertiser:
         self._thread.start()
 
     def _reannounce_loop(self, info: ServiceInfo) -> None:
+        # A burst of extra multicast re-announces right after startup, before
+        # settling into the steady-state interval below. This works around a
+        # real gap in zeroconf's own query handling (verified against zeroconf
+        # 0.150.0 source, _handlers/query_handler.py and _handlers/answers.py):
+        # a peer's mDNS query with the "QU" (unicast-response) bit set -- which
+        # Windows' Quick Share sends, confirmed by packet capture -- gets
+        # answered via construct_outgoing_unicast_answers, which builds its
+        # DNSOutgoing with multicast=False. _write_record_class then never
+        # sets the cache-flush bit (it's gated on `record.unique is True and
+        # self.multicast`), regardless of the record's own unique flag. So our
+        # very first reply to a fresh Windows query -- a unicast one, since
+        # that's what QU asks for -- carries SRV/TXT/A records Windows can't
+        # trust as authoritative, and Windows silently drops the device from
+        # its list without any error rather than wait for a later multicast
+        # copy. update_service()'s broadcast is real multicast and does carry
+        # the cache-flush bit correctly (confirmed by capture); the fix is
+        # just making sure one lands soon after we start, rather than relying
+        # solely on the 60s steady-state cadence below.
+        for _ in range(_STARTUP_REANNOUNCE_COUNT):
+            if self._stop_event.wait(_STARTUP_REANNOUNCE_INTERVAL_SECONDS):
+                return
+            try:
+                self._zeroconf.update_service(info)
+            except Exception:
+                return
         while not self._stop_event.wait(REANNOUNCE_INTERVAL_SECONDS):
             try:
                 self._zeroconf.update_service(info)
@@ -325,7 +379,13 @@ def run_receiver(
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("0.0.0.0", 0))
-    listener.listen(1)
+    # Windows' Quick Share discovery opens and immediately closes its own TCP
+    # connection to us on every mDNS re-announcement, just to test reachability
+    # before it'll list this device at all (see run_receiver's handling of
+    # framing.ConnectionClosedImmediately below) -- a backlog of 1 lets such a
+    # probe collide with the real transfer connection that follows once a
+    # human actually picks this device.
+    listener.listen(5)
     port = listener.getsockname()[1]
 
     address = pick_ipv4_address(iface)
@@ -344,10 +404,9 @@ def run_receiver(
     try:
         while True:
             conn, peer_addr = listener.accept()
-            print(f"Connection from {peer_addr[0]} (Ctrl+C cancels this transfer)", file=sys.stderr)
             debug.log("server", f"accepted connection from {peer_addr[0]}:{peer_addr[1]}")
             try:
-                outcome, completed = _handle_connection(conn, output_path, auto_accept, on_offer, on_progress)
+                outcome, completed = _handle_connection(conn, peer_addr[0], output_path, auto_accept, on_offer, on_progress)
                 debug.log("server", f"connection finished, outcome={outcome}")
                 if isinstance(on_progress, _ReceiveProgressPrinter):
                     on_progress.reset()  # close any bar left open by a canceled/disconnected transfer
@@ -364,6 +423,16 @@ def run_receiver(
                     print(color.red("Sender stopped the transfer before it finished."), file=sys.stderr)
                 elif outcome == TransferOutcome.SENDER_CANCELED:
                     print(color.yellow("Sender canceled the transfer."), file=sys.stderr)
+            except framing.ConnectionClosedImmediately:
+                # Windows' Quick Share opens and instantly closes a connection
+                # to us purely to test reachability before it'll list this
+                # device -- see WifiLanMedium::IsConnectableIpAddress in
+                # google/nearby's Windows backend. Expected background noise,
+                # not a failed transfer: no error banner, and skip the
+                # "Waiting for the next transfer" reprint too, since nothing
+                # user-visible happened.
+                debug.log("server", "peer closed immediately without sending data (Windows reachability probe)")
+                continue
             except Exception as exc:
                 print(color.red(f"\nTransfer failed: {exc}"), file=sys.stderr)
                 # The message alone rarely says where a protocol failure came

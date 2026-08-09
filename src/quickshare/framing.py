@@ -19,6 +19,18 @@ class FrameError(Exception):
     pass
 
 
+class ConnectionClosedImmediately(FrameError):
+    """Raised instead of the plain FrameError when the peer closed the
+    connection before sending a single byte. Windows' Quick Share discovery
+    does this on purpose -- WifiLanMedium::IsConnectableIpAddress opens a
+    real TCP connection to the advertised address purely to check
+    reachability before it will list a device, then closes it immediately
+    without writing anything (internal/platform/implementation/windows/
+    wifi_lan.cc: TestConnection) -- so callers on the first read of a new
+    connection should treat this as a benign liveness probe, not a failed
+    transfer."""
+
+
 def pack_frame(payload: bytes) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
 
@@ -34,6 +46,8 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     while remaining > 0:
         chunk = sock.recv(remaining)
         if not chunk:
+            if not chunks and remaining == n:
+                raise ConnectionClosedImmediately("connection closed without sending any data")
             raise FrameError("connection closed while reading frame")
         chunks.append(chunk)
         remaining -= len(chunk)

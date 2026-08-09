@@ -129,13 +129,16 @@ def build_connection_response_frame(accept: bool) -> list[bytes]:
     return wrap_offline_bytes_payload(inner.SerializeToString())
 
 
-_bytes_payload_id_counter = 0
-
-
 def _next_bytes_payload_id() -> int:
-    global _bytes_payload_id_counter
-    _bytes_payload_id_counter -= 1  # negative, to avoid colliding with sender's file payload ids
-    return _bytes_payload_id_counter
+    """Random positive id, matching real devices' random positive payload ids.
+    An earlier revision used a sequential counter starting at -1 "to avoid
+    colliding with the sender's file payload ids" -- Android tolerated that,
+    but the Windows Quick Share app rejects it outright: it answered our
+    first frame (the paired-key encryption, wrapped as payload id -1) with
+    CONTROL PAYLOAD_CANCELED payload_id=-1 and aborted the whole transfer,
+    -1 being a common invalid-id sentinel in the C++ stack. Random 63-bit
+    ids make sender collisions vanishingly unlikely without special-casing."""
+    return int.from_bytes(crypto.random_bytes(8), "big") >> 1 or 1
 
 
 def wrap_offline_bytes_payload(sharing_frame_bytes: bytes) -> list[bytes]:
