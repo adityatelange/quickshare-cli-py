@@ -18,8 +18,10 @@ import socket
 import sys
 import threading
 from pathlib import Path
+from typing import Optional
 
 import ifaddr
+from tqdm import tqdm
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 from quickshare import color, framing, mdns, ukey2
@@ -233,24 +235,50 @@ def format_size(num_bytes: int) -> str:
     return f"{size:.1f} GiB"
 
 
-_PROGRESS_BAR_WIDTH = 30
+class _ReceiveProgressPrinter:
+    """Stateful on_progress callback: one tqdm bar per incoming file, reused
+    across the many on_progress(incoming) calls that arrive as its chunks
+    write in. tqdm handles fitting the bar to the current terminal width
+    (and redrawing cleanly on resize) itself, which a hand-rolled \\r-based
+    bar doesn't -- narrower terminals used to leave stray characters behind
+    on redraw when the bar's line length changed between updates."""
+
+    def __init__(self) -> None:
+        self._bar: Optional[tqdm] = None
+        self._payload_id: Optional[int] = None
+
+    def __call__(self, incoming: IncomingFile) -> None:
+        if self._payload_id != incoming.payload_id:
+            if self._bar is not None:
+                self._bar.close()
+            self._bar = tqdm(
+                total=incoming.size,
+                desc=color.sanitize(incoming.name),
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                file=sys.stderr,
+                leave=True,
+                dynamic_ncols=True,
+            )
+            self._payload_id = incoming.payload_id
+        self._bar.n = incoming.bytes_written
+        self._bar.refresh()
+        if incoming.complete:
+            self.reset()
+
+    def reset(self) -> None:
+        """Close and drop any bar left open by a file that never reached
+        incoming.complete -- a canceled or disconnected transfer. Call this
+        after every connection, complete or not, so a stale bar never lingers
+        into the next one."""
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+        self._payload_id = None
 
 
-def _print_progress(incoming: IncomingFile) -> None:
-    fraction = incoming.bytes_written / incoming.size if incoming.size else 1.0
-    fraction = min(fraction, 1.0)
-    filled = int(_PROGRESS_BAR_WIDTH * fraction)
-    bar = "#" * filled + "-" * (_PROGRESS_BAR_WIDTH - filled)
-    print(
-        f"\r  {color.sanitize(incoming.name)}  [{color.cyan(bar)}] {fraction:5.1%}  "
-        f"({format_size(incoming.bytes_written)} / {format_size(incoming.size)})  "
-        f"{format_size(incoming.speed_bps)}/s",
-        end="",
-        file=sys.stderr,
-        flush=True,
-    )
-    if incoming.complete:
-        print(file=sys.stderr)  # newline once this file is done, so the next line isn't overwritten
+_print_progress = _ReceiveProgressPrinter()
 
 
 def _interactive_confirm(file_metadata: list, pin: str) -> bool:
@@ -305,6 +333,8 @@ def run_receiver(
             print(f"Connection from {peer_addr[0]} (Ctrl+C cancels this transfer)", file=sys.stderr)
             try:
                 outcome, completed = _handle_connection(conn, output_path, auto_accept, on_offer, on_progress)
+                if isinstance(on_progress, _ReceiveProgressPrinter):
+                    on_progress.reset()  # close any bar left open by a canceled/disconnected transfer
                 print(file=sys.stderr)  # end whatever progress line was mid-print
                 if outcome == TransferOutcome.COMPLETED:
                     print(color.green("Transfer finished. Saved:"), file=sys.stderr)

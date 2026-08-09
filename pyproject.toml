@@ -13,6 +13,7 @@ dependencies = [
     "zeroconf>=0.132",
     "protobuf>=5.27",
     "cryptography>=42",
+    "tqdm>=4.70.0",
 ]
 
 [dependency-groups]

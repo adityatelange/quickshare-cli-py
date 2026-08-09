@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from tqdm import tqdm
+
 from quickshare import color, crypto, discover, framing, mdns, ukey2
 from quickshare.proto import offline_wire_formats_pb2 as off_pb2
 from quickshare.proto import wire_format_pb2 as wf_pb2
@@ -50,7 +52,7 @@ from quickshare.receive import (
     wrap_offline_bytes_payload,
 )
 from quickshare.secure_frame import SecureChannel
-from quickshare.server import format_size, pick_ipv4_address
+from quickshare.server import pick_ipv4_address
 
 CHUNK_SIZE = 64 * 1024  # connections/implementation/flags/nearby_connections_feature_flags.h
 
@@ -467,23 +469,44 @@ def send_files(
 
 
 _DISCOVERY_SECONDS = 2.0
-_PROGRESS_BAR_WIDTH = 30
 
 
-def _print_send_progress(progress: SendProgress) -> None:
-    fraction = min(progress.bytes_sent / progress.total_bytes, 1.0) if progress.total_bytes else 1.0
-    filled = int(_PROGRESS_BAR_WIDTH * fraction)
-    bar = "#" * filled + "-" * (_PROGRESS_BAR_WIDTH - filled)
-    print(
-        f"\r  [{color.cyan(bar)}] {fraction:5.1%}  "
-        f"({format_size(progress.bytes_sent)} / {format_size(progress.total_bytes)})  "
-        f"{format_size(progress.speed_bps)}/s",
-        end="",
-        file=sys.stderr,
-        flush=True,
-    )
-    if progress.bytes_sent >= progress.total_bytes:
-        print(file=sys.stderr)
+class _SendProgressPrinter:
+    """Stateful on_progress callback backing a single tqdm bar for the whole
+    (possibly multi-file) transfer -- bytes_sent/total_bytes in SendProgress
+    are already cumulative across every file being sent. tqdm handles fitting
+    the bar to the current terminal width itself, unlike the old hand-rolled
+    \\r-based bar, which left stray characters behind on redraw whenever the
+    line length changed between updates on a narrow terminal."""
+
+    def __init__(self) -> None:
+        self._bar: Optional[tqdm] = None
+
+    def __call__(self, progress: SendProgress) -> None:
+        if self._bar is None:
+            self._bar = tqdm(
+                total=progress.total_bytes,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                file=sys.stderr,
+                dynamic_ncols=True,
+            )
+        self._bar.set_description(color.sanitize(progress.file_name))
+        self._bar.n = progress.bytes_sent
+        self._bar.refresh()
+        if progress.bytes_sent >= progress.total_bytes:
+            self.reset()
+
+    def reset(self) -> None:
+        """Close and drop the bar -- call once the transfer is done, canceled,
+        or disconnected, so a stale bar never lingers into the next send."""
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+
+
+_print_send_progress = _SendProgressPrinter()
 
 
 def _interactive_pick_device(devices: list["discover.DiscoveredDevice"]) -> Optional["discover.DiscoveredDevice"]:
@@ -566,6 +589,8 @@ def run_sender(
     except (OSError, SendError, ukey2.Ukey2Error) as exc:
         print(color.red(f"Send failed: {exc}"), file=sys.stderr)
         return 1
+    finally:
+        _print_send_progress.reset()  # close any bar left open by a canceled/failed transfer
 
     if status == USER_CANCELED:
         print(color.yellow("\nTransfer canceled."), file=sys.stderr)
