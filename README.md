@@ -8,12 +8,6 @@ send to another Android device or a ChromeOS/Windows machine.
 Receive-only, single connection at a time, no GUI, built for a Linux desktop
 that just needs to catch files from a phone.
 
-## Why this exists
-
-This has no GUI and no dependency on a desktop environment, so it runs on a
-headless box or a minimal window manager, starts instantly, and stays out of
-the way on a machine that just needs to catch a file from a phone.
-
 ## Features
 
 **Receiving**
@@ -47,9 +41,28 @@ the way on a machine that just needs to catch a file from a phone.
 - A network interface that can reach the sending phone (Wi-Fi or wired LAN —
   no Bluetooth needed)
 
+## Installation
+
+To just install the `quickshare` command, pick one:
+
+```bash
+# uv (recommended)
+uv tool install git+https://github.com/adityatelange/quickshare-cli-py
+
+# pipx
+pipx install git+https://github.com/adityatelange/quickshare-cli-py
+
+# pip
+pip install git+https://github.com/adityatelange/quickshare-cli-py
+```
+
+Any of these puts a `quickshare` command on your `PATH`.
+
 ## Setup
 
-```sh
+To work on the code instead:
+
+```bash
 uv sync
 ```
 
@@ -60,9 +73,13 @@ don't need to regenerate them to just run the receiver or sender).
 
 ## Usage
 
+Examples below use `uv run quickshare ...` (running from a source checkout,
+see [Setup](#setup)). If you installed via `uv tool`/`pipx`/`pip`, drop the
+`uv run` prefix and just run `quickshare ...`.
+
 ### Receiving
 
-```sh
+```bash
 uv run quickshare receive
 ```
 
@@ -71,7 +88,7 @@ to allow "everyone" (or your account/contacts, depending on Android version).
 When a transfer comes in you'll see a PIN to confirm on both devices, then a
 progress bar as the file downloads.
 
-```
+```bash
 uv run quickshare receive [-o OUTPUT_DIR] [-n NAME] [-i IFACE] [--yes] [--no-color]
 
   -o, --output-dir   Directory to save received files into (default: current directory)
@@ -87,7 +104,7 @@ transfer never appears as a complete file.
 
 ### Sending
 
-```sh
+```bash
 uv run quickshare send photo.jpg document.pdf
 ```
 
@@ -95,7 +112,7 @@ Browses for nearby Quick Share receivers for a few seconds, shows a numbered
 list, and asks which one to send to. Confirm the PIN shown here matches the
 one shown on the receiving device, then accept the transfer there.
 
-```
+```bash
 uv run quickshare send PATH [PATH ...] [-n NAME] [-i IFACE] [-t HOST:PORT] [--no-color]
 
   -n, --name         Device name to advertise as sender (default: hostname)
@@ -175,7 +192,7 @@ re-advertise on a fixed timer, original to this project.
 
 ## Project layout
 
-```
+```bash
 src/quickshare/
   mdns.py         mDNS advertisement: service type, TXT record, endpoint ID
   discover.py     mDNS browsing: parses discovered services back into devices
@@ -201,7 +218,7 @@ tmp/nearby/       local read-only clone of github.com/google/nearby, used as
 Only needed if you change a `.proto` file. Run the "Generate protobuf
 bindings" VS Code task, or equivalently:
 
-```sh
+```bash
 uv run python -m grpc_tools.protoc \
   -I proto \
   --python_out=src/quickshare/proto \
@@ -219,7 +236,7 @@ grpc_tools generates some cross-file imports as absolute (`import foo_pb2`)
 instead of relative; these need to be hand-fixed to `from . import foo_pb2 as foo__pb2`
 after regenerating, or the package won't import.
 
-```
+```diff
 -import securemessage_pb2 as securemessage__pb2
 +from . import securemessage_pb2 as securemessage__pb2
 ```

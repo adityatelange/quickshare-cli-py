@@ -2,7 +2,13 @@
 name = "quickshare-cli-py"
 version = "0.1.0"
 description = "Minimal CLI implementation of Quick Share for Linux"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10,<3.11"
+authors = [
+    { name = "Aditya Telange" },
+]
+urls = { Homepage = "https://github.com/adityatelange/quickshare-cli-py" }
 dependencies = [
     "zeroconf>=0.132",
     "protobuf>=5.27",
