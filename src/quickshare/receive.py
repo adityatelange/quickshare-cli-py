@@ -59,7 +59,7 @@ def build_paired_key_encryption_frame() -> list[bytes]:
             ),
         ),
     )
-    return _wrap_offline_bytes_payload(inner.SerializeToString())
+    return wrap_offline_bytes_payload(inner.SerializeToString())
 
 
 def build_paired_key_result_frame() -> list[bytes]:
@@ -72,7 +72,7 @@ def build_paired_key_result_frame() -> list[bytes]:
             ),
         ),
     )
-    return _wrap_offline_bytes_payload(inner.SerializeToString())
+    return wrap_offline_bytes_payload(inner.SerializeToString())
 
 
 def build_payload_canceled(payload_id: int) -> bytes:
@@ -126,7 +126,7 @@ def build_connection_response_frame(accept: bool) -> list[bytes]:
             connection_response=wf_pb2.ConnectionResponseFrame(status=status),
         ),
     )
-    return _wrap_offline_bytes_payload(inner.SerializeToString())
+    return wrap_offline_bytes_payload(inner.SerializeToString())
 
 
 _bytes_payload_id_counter = 0
@@ -138,7 +138,7 @@ def _next_bytes_payload_id() -> int:
     return _bytes_payload_id_counter
 
 
-def _wrap_offline_bytes_payload(sharing_frame_bytes: bytes) -> list[bytes]:
+def wrap_offline_bytes_payload(sharing_frame_bytes: bytes) -> list[bytes]:
     """Wrap a serialized sharing_nearby.Frame as a one-shot BYTES PayloadTransferFrame.
 
     Returns two separately-serialized OfflineFrame byte-strings -- a data chunk and an
@@ -201,6 +201,7 @@ class IncomingFile:
     _fh: object = field(default=None, repr=False)
     bytes_written: int = 0
     started_at: float = field(default=0.0, repr=False)
+    finalized: bool = field(default=False, repr=False)
 
     @property
     def partial_path(self) -> Path:
@@ -228,6 +229,7 @@ class IncomingFile:
         """Call once fully received: atomically rename .part -> the real name."""
         self.close()
         self.partial_path.rename(self.dest_path)
+        self.finalized = True
 
     def discard(self) -> None:
         """Call on cancel/abort: remove the partial file instead of finalizing it."""
@@ -245,18 +247,46 @@ class IncomingFile:
         return self.bytes_written / elapsed if elapsed > 0 else 0.0
 
 
+def sanitize_offered_name(name: str) -> str:
+    """FileMetadata.name comes from the sender and is otherwise untrusted --
+    without this, a malicious peer could offer a name like "../../.ssh/authorized_keys"
+    or an absolute path "/etc/cron.d/evil" and, since callers naively join it
+    onto output_dir, write outside the intended output directory entirely.
+
+    Matches google/nearby's own SanitizeFileName (internal/base/file_path_sanitize.cc):
+    truncate at the first NUL byte, normalize backslashes to forward slashes,
+    then keep only the final path component (everything after the last '/').
+    Backslash normalization matters even on Linux, where '\\' is a legal
+    filename character and NOT a path separator -- without it, a Windows-style
+    traversal string like "..\\..\\evil" would pass through basename() as one
+    untouched "filename" instead of being caught. We additionally strip
+    leading dots (upstream doesn't need to: it has no equivalent of Python's
+    os.path.basename leaving a bare ".." or "." untouched)."""
+    truncated = name.split("\x00", 1)[0]
+    normalized = truncated.replace("\\", "/")
+    base = normalized.rsplit("/", 1)[-1]
+    base = base.lstrip(".")
+    return base or "unnamed_file"
+
+
 def unique_destination(output_dir: Path, name: str) -> Path:
-    """Avoid clobbering existing files: 'photo.jpg' -> 'photo (1).jpg' -> 'photo (2).jpg' ..."""
+    """Avoid clobbering existing files: 'photo.jpg' -> 'photo (1).jpg' -> 'photo (2).jpg' ...
+
+    name must already be sanitized (see sanitize_offered_name) -- this
+    doesn't re-sanitize, but does verify as defense-in-depth that the
+    resulting path is still actually inside output_dir before returning it.
+    """
+    output_dir = output_dir.resolve()
     candidate = output_dir / name
-    if not candidate.exists():
-        return candidate
     stem, ext = os.path.splitext(name)
-    n = 1
-    while True:
-        candidate = output_dir / f"{stem} ({n}){ext}"
-        if not candidate.exists():
-            return candidate
+    n = 0
+    while candidate.exists():
         n += 1
+        candidate = output_dir / f"{stem} ({n}){ext}"
+
+    if output_dir not in candidate.resolve().parents:
+        raise ReceiveError(f"refusing to write outside output directory: {candidate}")
+    return candidate
 
 
 SENDER_CANCELED = "sender_canceled"
@@ -317,6 +347,12 @@ class ReceiveSession:
             incoming = self.files_by_payload_id.get(header.id)
             if incoming is None:
                 raise ReceiveError(f"received FILE payload chunk for unknown payload_id {header.id}")
+            if incoming.finalized:
+                # A file that fits entirely in one data chunk finalizes on
+                # that chunk (already complete); the sender's separate empty
+                # LAST_CHUNK terminator still arrives afterwards and is a
+                # harmless no-op here rather than a re-finalize attempt.
+                return None
             if chunk.body:
                 incoming.write_chunk(chunk.offset, chunk.body)
                 if self.on_progress:
@@ -349,8 +385,9 @@ class ReceiveSession:
         self._offer_accepted = accept
         if accept:
             for meta in introduction.file_metadata:
-                dest = unique_destination(self.output_dir, meta.name or f"file-{meta.payload_id}")
-                incoming = IncomingFile(payload_id=meta.payload_id, name=meta.name, size=meta.size, dest_path=dest)
+                safe_name = sanitize_offered_name(meta.name) if meta.name else f"file-{meta.payload_id}"
+                dest = unique_destination(self.output_dir, safe_name)
+                incoming = IncomingFile(payload_id=meta.payload_id, name=safe_name, size=meta.size, dest_path=dest)
                 incoming.open()
                 self.files_by_payload_id[meta.payload_id] = incoming
 

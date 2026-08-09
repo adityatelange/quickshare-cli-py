@@ -17,6 +17,13 @@ def build_parser() -> argparse.ArgumentParser:
     receive.add_argument("--yes", action="store_true", help="Auto-accept incoming transfers without prompting")
     receive.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
 
+    send = sub.add_parser("send", help="Discover a nearby device and send it one or more files")
+    send.add_argument("paths", nargs="+", help="File path(s) to send")
+    send.add_argument("-n", "--name", default=None, help="Device name to advertise as sender (default: hostname)")
+    send.add_argument("-i", "--iface", default=None, help="Network interface to use for discovery, e.g. enp6s0 (default: auto-detect)")
+    send.add_argument("-t", "--target", default=None, metavar="HOST:PORT", help="Connect directly instead of discovering (skips the device picker)")
+    send.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
+
     return parser
 
 
@@ -37,6 +44,21 @@ def main(argv: list[str] | None = None) -> int:
             device_name=args.name or default_device_name(),
             iface=args.iface,
             auto_accept=args.yes,
+        )
+
+    if args.command == "send":
+        if args.no_color:
+            from quickshare import color
+
+            color.disable()
+
+        from quickshare.send import run_sender
+
+        return run_sender(
+            paths=args.paths,
+            device_name=args.name or default_device_name(),
+            iface=args.iface,
+            target=args.target,
         )
 
     parser.print_help()

@@ -5,6 +5,7 @@ output stays clean."""
 from __future__ import annotations
 
 import sys
+import unicodedata
 
 _ENABLED = sys.stderr.isatty()
 
@@ -38,6 +39,20 @@ _CODES = {
 def disable() -> None:
     global _ENABLED
     _ENABLED = False
+
+
+def sanitize(text: str) -> str:
+    """Strip terminal control characters (ANSI escapes, backspace, carriage
+    return, etc.) from a string before printing it. Use this on any value
+    that came from the peer -- a device name (mdns/discover.py), a filename
+    (IntroductionFrame.file_metadata) -- since those are attacker-controlled
+    and would otherwise let a malicious device manipulate our terminal output
+    (clear the screen, overwrite prior lines, spoof a fake prompt) via
+    embedded escape sequences. Printable Unicode (accents, emoji, CJK, etc.)
+    is preserved; only the Unicode "Cc" (control) and "Cf" (format, e.g.
+    bidi overrides) categories are removed. Not needed for values we
+    generate ourselves (our own device name, error messages)."""
+    return "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf"))
 
 
 def _wrap(text: str, *codes: str) -> str:

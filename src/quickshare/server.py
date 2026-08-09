@@ -33,7 +33,7 @@ REANNOUNCE_INTERVAL_SECONDS = 60.0
 _VIRTUAL_IFACE_PREFIXES = ("vmnet", "docker", "br-", "veth", "virbr", "lo")
 
 
-def _pick_ipv4_address(preferred_iface: str | None) -> str:
+def pick_ipv4_address(preferred_iface: str | None) -> str:
     """Select a non-loopback, non-virtual IPv4 address to advertise.
 
     If preferred_iface is given, use its first IPv4 address. Otherwise probe
@@ -224,7 +224,7 @@ class _Advertiser:
         self._zeroconf.close()
 
 
-def _format_size(num_bytes: int) -> str:
+def format_size(num_bytes: int) -> str:
     size = float(num_bytes)
     for unit in ("B", "KiB", "MiB", "GiB"):
         if size < 1024 or unit == "GiB":
@@ -242,9 +242,9 @@ def _print_progress(incoming: IncomingFile) -> None:
     filled = int(_PROGRESS_BAR_WIDTH * fraction)
     bar = "#" * filled + "-" * (_PROGRESS_BAR_WIDTH - filled)
     print(
-        f"\r  {incoming.name}  [{color.cyan(bar)}] {fraction:5.1%}  "
-        f"({_format_size(incoming.bytes_written)} / {_format_size(incoming.size)})  "
-        f"{_format_size(incoming.speed_bps)}/s",
+        f"\r  {color.sanitize(incoming.name)}  [{color.cyan(bar)}] {fraction:5.1%}  "
+        f"({format_size(incoming.bytes_written)} / {format_size(incoming.size)})  "
+        f"{format_size(incoming.speed_bps)}/s",
         end="",
         file=sys.stderr,
         flush=True,
@@ -257,7 +257,7 @@ def _interactive_confirm(file_metadata: list, pin: str) -> bool:
     print(f"\nIncoming transfer, confirmation code: {color.bold(color.yellow(pin))}", file=sys.stderr)
     print("Confirm this code matches what your phone shows before accepting.", file=sys.stderr)
     for meta in file_metadata:
-        print(f"  {meta.name}  ({_format_size(meta.size)})", file=sys.stderr)
+        print(f"  {color.sanitize(meta.name)}  ({format_size(meta.size)})", file=sys.stderr)
     sys.stderr.flush()
     try:
         answer = input("Accept? [y/N] ").strip().lower()
@@ -295,7 +295,7 @@ def run_receiver(
     listener.listen(1)
     port = listener.getsockname()[1]
 
-    address = _pick_ipv4_address(iface)
+    address = pick_ipv4_address(iface)
 
     advertiser = _Advertiser(device_name=device_name, port=port, address=address)
     advertiser.start()

@@ -53,7 +53,7 @@ _ENDPOINT_ID_LENGTH = 4
 
 # connections/implementation/pcp.h
 _PCP_P2P_POINT_TO_POINT = 3  # Pcp::kP2pPointToPoint -- matches a live-captured advertisement on this LAN
-_WIFI_LAN_SERVICE_INFO_VERSION = 1  # WifiLanServiceInfo::Version::kV1
+WIFI_LAN_SERVICE_INFO_VERSION = 1  # WifiLanServiceInfo::Version::kV1 -- shared with discover.py's parser
 
 
 class ShareTargetType(IntEnum):
@@ -98,14 +98,14 @@ def build_service_instance_name(endpoint_id: bytes) -> str:
     """
     if len(endpoint_id) != _ENDPOINT_ID_LENGTH:
         raise ValueError(f"endpoint_id must be exactly {_ENDPOINT_ID_LENGTH} bytes")
-    version_and_pcp = ((_WIFI_LAN_SERVICE_INFO_VERSION & 0b111) << 5) | (_PCP_P2P_POINT_TO_POINT & 0b11111)
+    version_and_pcp = ((WIFI_LAN_SERVICE_INFO_VERSION & 0b111) << 5) | (_PCP_P2P_POINT_TO_POINT & 0b11111)
     payload = bytes([version_and_pcp]) + endpoint_id + _INSTANCE_SERVICE_ID_HASH
     return _web_safe_base64_encode(payload)
 
 
-# sharing/advertisement.h / advertisement.cc
-_ADVERTISEMENT_SALT_SIZE = 2
-_ADVERTISEMENT_METADATA_KEY_SIZE = 14
+# sharing/advertisement.h / advertisement.cc -- shared with discover.py's parser
+ADVERTISEMENT_SALT_SIZE = 2
+ADVERTISEMENT_METADATA_KEY_SIZE = 14
 _ADVERTISEMENT_VERSION = 0
 _TLV_TYPE_VENDOR_ID = 2
 _TLV_TYPE_CAPABILITIES = 3
@@ -134,8 +134,8 @@ def build_endpoint_info(device_name: str | None, device_type: ShareTargetType) -
         | ((int(device_type) & 0b111) << 1)
     )
     endpoint_info = bytearray([byte0])
-    endpoint_info += random.randbytes(_ADVERTISEMENT_SALT_SIZE)
-    endpoint_info += random.randbytes(_ADVERTISEMENT_METADATA_KEY_SIZE)
+    endpoint_info += random.randbytes(ADVERTISEMENT_SALT_SIZE)
+    endpoint_info += random.randbytes(ADVERTISEMENT_METADATA_KEY_SIZE)
 
     if has_device_name:
         name_bytes = device_name.encode("utf-8")

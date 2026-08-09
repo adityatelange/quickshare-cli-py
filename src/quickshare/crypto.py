@@ -110,7 +110,15 @@ def to_four_digit_pin(auth_string: bytes) -> str:
         signed_b = b - 256 if b >= 128 else b
         h = int(math.fmod(h + signed_b * multiplier, k_hash_modulo))
         multiplier = int(math.fmod(multiplier * k_hash_base_multiplier, k_hash_modulo))
-    return f"{abs(h):04d}"
+    pin = f"{abs(h):04d}"
+    # h is always reduced mod 9973 above, so abs(h) is always in [0, 9972] and
+    # this can never actually fail -- a tripwire in one shared place (both
+    # server.py's receive flow and send.py's send flow read D2DKeys.pin
+    # through here) against a future refactor silently breaking that
+    # guarantee and letting something other than 4 plain digits reach the
+    # terminal via _interactive_confirm/on_pin.
+    assert pin.isdigit() and len(pin) == 4, f"PIN derivation produced non-digit output: {pin!r}"
+    return pin
 
 
 @dataclass
@@ -126,12 +134,22 @@ class D2DKeys:
         return to_four_digit_pin(self.auth_string)
 
 
-def derive_d2d_keys(shared_secret: bytes, client_init_bytes: bytes, server_init_bytes: bytes) -> D2DKeys:
+def derive_d2d_keys(
+    shared_secret: bytes, client_init_bytes: bytes, server_init_bytes: bytes, *, is_server: bool = True
+) -> D2DKeys:
     """Derive the four D2D session keys from the (already SHA-256'd) ECDH secret.
 
     ukey_info = raw on-wire ClientInit Ukey2Message bytes || raw on-wire ServerInit
     Ukey2Message bytes -- must be the exact bytes seen on the socket, not a
     re-serialization, since the auth/next HKDF steps are byte-sensitive.
+
+    Everything through the "client"/"server" D2D sub-keys is fully symmetric --
+    both roles run the identical derivation (D2DConnectionContextV1::ToConnectionContext,
+    third_party/ukey2/ukey2/src/main/cpp/src/securegcm/ukey2_handshake.cc). The
+    only role-dependent step is which sub-key becomes "encrypt" vs "decrypt":
+    is_server=True (default) matches this project's original server-only
+    implementation (encrypt with the server key, decrypt with the client key);
+    is_server=False swaps that assignment for the client role.
     """
     ukey_info = client_init_bytes + server_init_bytes
 
@@ -141,10 +159,12 @@ def derive_d2d_keys(shared_secret: bytes, client_init_bytes: bytes, server_init_
     d2d_client = hkdf_extract_expand(_D2D_SALT, next_secret, b"client", 32)
     d2d_server = hkdf_extract_expand(_D2D_SALT, next_secret, b"server", 32)
 
-    decrypt_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, d2d_client, b"ENC:2", 32)
-    recv_hmac_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, d2d_client, b"SIG:1", 32)
-    encrypt_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, d2d_server, b"ENC:2", 32)
-    send_hmac_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, d2d_server, b"SIG:1", 32)
+    own_key, peer_key = (d2d_server, d2d_client) if is_server else (d2d_client, d2d_server)
+
+    encrypt_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, own_key, b"ENC:2", 32)
+    send_hmac_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, own_key, b"SIG:1", 32)
+    decrypt_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, peer_key, b"ENC:2", 32)
+    recv_hmac_key = hkdf_extract_expand(_SECUREMESSAGE_SALT, peer_key, b"SIG:1", 32)
 
     return D2DKeys(decrypt_key, recv_hmac_key, encrypt_key, send_hmac_key, auth_string)
 
