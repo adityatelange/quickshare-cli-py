@@ -269,10 +269,6 @@ def _interactive_confirm(file_metadata: list, pin: str) -> bool:
     return accepted
 
 
-def _print_banner() -> None:
-    print(color.dim("Quick Share for Linux -- minimal receiver\n"), file=sys.stderr)
-
-
 def run_receiver(
     output_dir: str,
     device_name: str,
@@ -281,7 +277,7 @@ def run_receiver(
     on_offer=None,
     on_progress=None,
 ) -> int:
-    _print_banner()
+    print(color.dim("Minimal Quick Share CLI client for Linux\n"), file=sys.stderr)
     if on_progress is None:
         on_progress = _print_progress
     if on_offer is None and not auto_accept:

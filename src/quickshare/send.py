@@ -515,7 +515,7 @@ def run_sender(
     """CLI entry point: browse for nearby receivers, let the user pick one
     (or connect directly to target if given as "host:port"), then send every
     path in paths. Returns a process exit code."""
-    print(color.dim("Quick Share for Linux -- minimal unofficial CLI client\n"), file=sys.stderr)
+    print(color.dim("Minimal Quick Share CLI client for Linux\n"), file=sys.stderr)
 
     file_paths = [Path(p).resolve() for p in paths]
     missing = [p for p in file_paths if not p.is_file()]

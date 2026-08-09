@@ -208,9 +208,6 @@ src/quickshare/
   proto/          generated protobuf bindings (see proto/*.proto for sources)
 
 proto/            vendored .proto schemas, copied verbatim from google/nearby
-tmp/nearby/       local read-only clone of github.com/google/nearby, used as
-                  the reference source for all protocol logic (not imported
-                  or shipped — reference only)
 ```
 
 ## Regenerating protobuf bindings
