@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Generate protobuf bindings",
+      "type": "shell",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "grpc_tools.protoc",
+        "-I",
+        "proto",
+        "--python_out=src/quickshare/proto",
+        "--pyi_out=src/quickshare/proto",
+        "proto/device_to_device_messages.proto",
+        "proto/offline_wire_formats.proto",
+        "proto/securegcm.proto",
+        "proto/securemessage.proto",
+        "proto/ukey.proto",
+        "proto/wire_format.proto",
+        "proto/proto/sharing_enums.proto"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    }
+  ]
+}

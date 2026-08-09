@@ -1,0 +1,25 @@
+[project]
+name = "quickshare-cli-py"
+version = "0.1.0"
+description = "Minimal CLI implementation of Quick Share for Linux"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "zeroconf>=0.132",
+    "protobuf>=5.27",
+    "cryptography>=42",
+]
+
+[dependency-groups]
+dev = [
+    "grpcio-tools>=1.60",
+]
+
+[project.scripts]
+quickshare = "quickshare.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quickshare"]

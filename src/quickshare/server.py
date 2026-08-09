@@ -1,0 +1,334 @@
+"""TCP + mDNS server glue: binds a listening socket, advertises it over mDNS
+per mdns.py, accepts one connection at a time, drives the UKEY2 handshake,
+and hands off to receive.ReceiveSession for the application-level flow.
+
+There is no Bluetooth on this host (see project notes), so there is no BLE
+nudge to trigger a fresh mDNS announcement when a phone comes looking.
+google/nearby itself has no analog for this: every platform backend (Windows
+DNS-SD, Apple Bonjour, the generic WifiLanMedium) calls StartAdvertising
+exactly once per session, with no re-registration loop -- it relies on the
+BLE nudge instead. Since this host can't replicate that trigger, this
+project falls back to a blind periodic timer instead: a plain re-advertise
+on a fixed interval.
+"""
+
+from __future__ import annotations
+
+import socket
+import sys
+import threading
+from pathlib import Path
+
+import ifaddr
+from zeroconf import IPVersion, ServiceInfo, Zeroconf
+
+from quickshare import color, framing, mdns, ukey2
+from quickshare.proto import offline_wire_formats_pb2 as off_pb2
+from quickshare.receive import SENDER_CANCELED, IncomingFile, ReceiveSession, build_connection_response_accept
+from quickshare.secure_frame import SecureChannel
+
+REANNOUNCE_INTERVAL_SECONDS = 60.0
+
+
+_VIRTUAL_IFACE_PREFIXES = ("vmnet", "docker", "br-", "veth", "virbr", "lo")
+
+
+def _pick_ipv4_address(preferred_iface: str | None) -> str:
+    """Select a non-loopback, non-virtual IPv4 address to advertise.
+
+    If preferred_iface is given, use its first IPv4 address. Otherwise probe
+    the OS's default-route interface, then fall back to the first adapter
+    whose name doesn't look virtual -- skipping vmnet/docker/bridge
+    interfaces matters concretely on this host, which runs Docker and
+    VMware alongside a single physical NIC, and a phone can't reach an
+    address handed out on one of those.
+    """
+    if preferred_iface is not None:
+        for adapter in ifaddr.get_adapters():
+            if adapter.nice_name == preferred_iface:
+                for ip in adapter.ips:
+                    if ip.is_IPv4:
+                        return ip.ip
+        raise ValueError(f"interface {preferred_iface!r} not found or has no IPv4 address")
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            address = probe.getsockname()[0]
+        for adapter in ifaddr.get_adapters():
+            if any(ip.is_IPv4 and ip.ip == address for ip in adapter.ips):
+                if not adapter.nice_name.startswith(_VIRTUAL_IFACE_PREFIXES):
+                    return address
+    except OSError:
+        pass
+
+    for adapter in ifaddr.get_adapters():
+        if adapter.nice_name.startswith(_VIRTUAL_IFACE_PREFIXES):
+            continue
+        for ip in adapter.ips:
+            if ip.is_IPv4:
+                return ip.ip
+
+    raise RuntimeError("no usable non-virtual IPv4 interface found")
+
+
+def _read_offline_frame_plaintext(sock: socket.socket) -> off_pb2.OfflineFrame:
+    frame = off_pb2.OfflineFrame()
+    frame.ParseFromString(framing.recv_frame(sock))
+    return frame
+
+
+def _run_handshake(sock: socket.socket) -> tuple[SecureChannel, str]:
+    connection_request_frame = _read_offline_frame_plaintext(sock)
+    if connection_request_frame.v1.type != off_pb2.V1Frame.FrameType.CONNECTION_REQUEST:
+        raise ukey2.Ukey2Error("expected ConnectionRequest as the first frame")
+
+    client_init_bytes = framing.recv_frame(sock)
+
+    def send_server_init(raw_server_init_bytes: bytes) -> None:
+        framing.send_frame(sock, raw_server_init_bytes)
+
+    def recv_client_finished() -> bytes:
+        return framing.recv_frame(sock)
+
+    result = ukey2.run_server_handshake(client_init_bytes, send_server_init, recv_client_finished)
+
+    framing.send_frame(sock, build_connection_response_accept())
+
+    # The phone also sends its own plaintext ConnectionResponse back to us at
+    # this point (location.nearby.connections.V1Frame.CONNECTION_RESPONSE) --
+    # both sides exchange one. It carries nothing we need (accept/reject,
+    # its OS info, a multiplex-socket bitmask we don't use), but it must be
+    # read off the wire here or the receive loop below mistakes it for the
+    # first encrypted SecureMessage.
+    peer_connection_response = _read_offline_frame_plaintext(sock)
+    if peer_connection_response.v1.type != off_pb2.V1Frame.FrameType.CONNECTION_RESPONSE:
+        raise ukey2.Ukey2Error(
+            f"expected peer ConnectionResponse, got frame type {peer_connection_response.v1.type}"
+        )
+
+    keys = result.keys
+    channel = SecureChannel(
+        encrypt_key=keys.encrypt_key,
+        decrypt_key=keys.decrypt_key,
+        send_hmac_key=keys.send_hmac_key,
+        recv_hmac_key=keys.recv_hmac_key,
+    )
+    return channel, keys.pin
+
+
+class TransferOutcome:
+    """Why _handle_connection ended, distinguishing an in-progress transfer
+    getting cut off from it never having been accepted at all."""
+
+    COMPLETED = "completed"
+    DECLINED = "declined"
+    CANCELED = "canceled"
+    SENDER_DISCONNECTED = "sender_disconnected"
+    SENDER_CANCELED = "sender_canceled"
+
+
+def _handle_connection(
+    sock: socket.socket,
+    output_dir: Path,
+    auto_accept: bool,
+    on_offer,
+    on_progress,
+) -> tuple[str, list[Path] | None]:
+    """Returns (outcome, completed_file_paths). completed_file_paths is only
+    populated when outcome == TransferOutcome.COMPLETED."""
+    with sock:
+        channel, pin = _run_handshake(sock)
+
+        session = ReceiveSession(
+            channel=channel,
+            output_dir=output_dir,
+            pin=pin,
+            auto_accept=auto_accept,
+            on_offer=on_offer,
+            on_progress=on_progress,
+            channel_send=lambda payload: framing.send_frame(sock, payload),
+        )
+        session.start()
+
+        try:
+            while True:
+                try:
+                    secure_message_bytes = framing.recv_frame(sock)
+                except framing.FrameError:
+                    if session.files_by_payload_id:
+                        session.discard_incomplete()
+                        return TransferOutcome.SENDER_DISCONNECTED, None
+                    return TransferOutcome.DECLINED, None
+                result = session.handle_encrypted_frame(secure_message_bytes)
+                if result == SENDER_CANCELED:
+                    return TransferOutcome.SENDER_CANCELED, None
+                if result is not None:
+                    return TransferOutcome.COMPLETED, result
+        except KeyboardInterrupt:
+            print("\nCanceling transfer...", file=sys.stderr)
+            session.cancel()
+            return TransferOutcome.CANCELED, None
+
+
+class _Advertiser:
+    def __init__(self, device_name: str, port: int, address: str) -> None:
+        self._device_name = device_name
+        self._port = port
+        self._address = address
+        # Binding only the interface we're actually advertising on (instead of
+        # every interface on the host) noticeably cuts zeroconf's startup time
+        # on this host, which has 6 interfaces (physical NIC + docker0 + a
+        # bridge + 3 VMware vmnets) that would otherwise all be bound.
+        self._zeroconf = Zeroconf(interfaces=[address], ip_version=IPVersion.V4Only)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        # Stable across restarts (derived from hostname) rather than random,
+        # so the phone recognizes this machine as the same device each time
+        # instead of listing a new one on every run.
+        self._endpoint_id = mdns.stable_endpoint_id()
+
+    def _build_service_info(self) -> ServiceInfo:
+        instance_name = mdns.build_service_instance_name(self._endpoint_id)
+        txt_value = mdns.build_endpoint_info_txt_value(self._device_name, mdns.ShareTargetType.LAPTOP)
+        return ServiceInfo(
+            type_=mdns.SERVICE_TYPE,
+            name=f"{instance_name}.{mdns.SERVICE_TYPE}",
+            addresses=[socket.inet_aton(self._address)],
+            port=self._port,
+            properties={mdns.TXT_KEY_ENDPOINT_INFO.encode(): txt_value},
+        )
+
+    def start(self) -> None:
+        info = self._build_service_info()
+        self._zeroconf.register_service(info, allow_name_change=False)
+        self._thread = threading.Thread(target=self._reannounce_loop, args=(info,), daemon=True)
+        self._thread.start()
+
+    def _reannounce_loop(self, info: ServiceInfo) -> None:
+        while not self._stop_event.wait(REANNOUNCE_INTERVAL_SECONDS):
+            try:
+                self._zeroconf.update_service(info)
+            except Exception:
+                # zeroconf may already be mid-close() by the time this runs
+                # (stop() no longer waits for this thread) -- harmless, the
+                # process is shutting down either way.
+                return
+
+    def stop(self) -> None:
+        # No thread join: the reannounce thread is a daemon that dies with the
+        # process, and it may be mid-update_service() for up to a few hundred
+        # ms -- waiting for it here would only slow shutdown down for no
+        # correctness benefit, since we're tearing everything down anyway.
+        self._stop_event.set()
+        self._zeroconf.close()
+
+
+def _format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
+_PROGRESS_BAR_WIDTH = 30
+
+
+def _print_progress(incoming: IncomingFile) -> None:
+    fraction = incoming.bytes_written / incoming.size if incoming.size else 1.0
+    fraction = min(fraction, 1.0)
+    filled = int(_PROGRESS_BAR_WIDTH * fraction)
+    bar = "#" * filled + "-" * (_PROGRESS_BAR_WIDTH - filled)
+    print(
+        f"\r  {incoming.name}  [{color.cyan(bar)}] {fraction:5.1%}  "
+        f"({_format_size(incoming.bytes_written)} / {_format_size(incoming.size)})  "
+        f"{_format_size(incoming.speed_bps)}/s",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    if incoming.complete:
+        print(file=sys.stderr)  # newline once this file is done, so the next line isn't overwritten
+
+
+def _interactive_confirm(file_metadata: list, pin: str) -> bool:
+    print(f"\nIncoming transfer, confirmation code: {color.bold(color.yellow(pin))}", file=sys.stderr)
+    print("Confirm this code matches what your phone shows before accepting.", file=sys.stderr)
+    for meta in file_metadata:
+        print(f"  {meta.name}  ({_format_size(meta.size)})", file=sys.stderr)
+    sys.stderr.flush()
+    try:
+        answer = input("Accept? [y/N] ").strip().lower()
+    except EOFError:
+        print(color.yellow("(no input available -- declining)"), file=sys.stderr)
+        return False
+    accepted = answer in ("y", "yes")
+    print(color.green("Accepted.") if accepted else color.yellow("Declined."), file=sys.stderr)
+    return accepted
+
+
+def _print_banner() -> None:
+    print(color.dim("Quick Share for Linux -- minimal receiver\n"), file=sys.stderr)
+
+
+def run_receiver(
+    output_dir: str,
+    device_name: str,
+    iface: str | None,
+    auto_accept: bool,
+    on_offer=None,
+    on_progress=None,
+) -> int:
+    _print_banner()
+    if on_progress is None:
+        on_progress = _print_progress
+    if on_offer is None and not auto_accept:
+        on_offer = _interactive_confirm
+    output_path = Path(output_dir).resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    address = _pick_ipv4_address(iface)
+
+    advertiser = _Advertiser(device_name=device_name, port=port, address=address)
+    advertiser.start()
+
+    print(color.cyan(f"Advertising as {device_name!r} on {address}:{port}, saving to {output_path}"), file=sys.stderr)
+    print(color.cyan("Waiting for an incoming transfer (Ctrl+C to stop)..."), file=sys.stderr)
+
+    try:
+        while True:
+            conn, peer_addr = listener.accept()
+            print(f"Connection from {peer_addr[0]} (Ctrl+C cancels this transfer)", file=sys.stderr)
+            try:
+                outcome, completed = _handle_connection(conn, output_path, auto_accept, on_offer, on_progress)
+                print(file=sys.stderr)  # end whatever progress line was mid-print
+                if outcome == TransferOutcome.COMPLETED:
+                    print(color.green("Transfer finished. Saved:"), file=sys.stderr)
+                    for path in completed:
+                        print(f"  {path}", file=sys.stderr)
+                elif outcome == TransferOutcome.DECLINED:
+                    print(color.yellow("Transfer declined."), file=sys.stderr)
+                elif outcome == TransferOutcome.CANCELED:
+                    print(color.yellow("Transfer canceled."), file=sys.stderr)
+                elif outcome == TransferOutcome.SENDER_DISCONNECTED:
+                    print(color.red("Sender stopped the transfer before it finished."), file=sys.stderr)
+                elif outcome == TransferOutcome.SENDER_CANCELED:
+                    print(color.yellow("Sender canceled the transfer."), file=sys.stderr)
+            except Exception as exc:
+                print(color.red(f"\nTransfer failed: {exc}"), file=sys.stderr)
+            print(color.cyan("\nWaiting for the next incoming transfer (Ctrl+C to stop)..."), file=sys.stderr)
+    except KeyboardInterrupt:
+        print("\nStopping.", file=sys.stderr)
+    finally:
+        advertiser.stop()
+        listener.close()
+
+    return 0
