@@ -1,44 +1,22 @@
-# quickshare-cli-py
+# Quick Share CLI (for Linux)
 
-A minimal, dependency-light Python receiver for **Google Quick Share** (formerly
-Nearby Share) on Linux. Run it on a laptop or desktop with no Bluetooth adapter,
-and Android phones on the same network can send files to it the same way they
-send to another Android device or a ChromeOS/Windows machine.
+A minimal, dependency-light Python CLI for **Google Quick Share** (formerly
+Nearby Share) on Linux: send and receive. Run it on a laptop or desktop with
+no Bluetooth adapter, and Android phones on the same network can send files
+to it, or receive files from it, the same way they would with another
+Android device or a ChromeOS/Windows machine.
 
-Receive-only, single connection at a time, no GUI, built for a Linux desktop
-that just needs to catch files from a phone.
+One connection at a time (though a single transfer can bundle multiple
+files, e.g. `quickshare send Downloads/*.pdf`), no GUI, built for a Linux
+desktop or headless box that just needs to shuttle files to or from a phone.
 
-## Features
-
-**Receiving**
-- Advertises over mDNS (`_FC9F5ED42C8A._tcp.local.`) so phones on the same
-  LAN/Wi-Fi discover this machine as a Quick Share target
-- PIN-verified consent prompt before accepting a transfer (or `--yes` to
-  auto-accept)
-- Cancel a transfer mid-flight (Ctrl+C on the receiver, or from the sender);
-  either way the partial file is discarded, never left under its real name
-- Stable device identity across restarts (derived from hostname, not MAC —
-  no more re-pairing every time you restart the receiver)
-
-**Sending**
-- Browses mDNS for nearby Quick Share receivers and shows an interactive
-  numbered picker, or connect directly with `--target host:port`
-- Sends one or more files in a single transfer, with a PIN shown for the
-  same confirmation-code check as receiving
-- Interoperates with real Android/ChromeOS/Windows Quick Share receivers,
-  not just this project's own receiver
-
-**Both directions**
-- Full UKEY2 handshake (ECDH P-256 + HKDF-SHA256) and SecureMessage frame
-  encryption (AES-256-CBC + HMAC-SHA256)
-- Live progress bar with percentage (and transfer speed, when receiving)
-- Colored terminal output (`--no-color` to disable)
+<video src="https://github.com/user-attachments/assets/1353b8a4-a15f-4721-9277-680a5db0ffa1"></video>
 
 ## Requirements
 
 - Linux, Python 3.10
 - [uv](https://docs.astral.sh/uv/) for dependency management
-- A network interface that can reach the sending phone (Wi-Fi or wired LAN —
+- A network interface that can reach the sending phone (Wi-Fi or wired LAN,
   no Bluetooth needed)
 
 ## Installation
@@ -58,6 +36,34 @@ pip install git+https://github.com/adityatelange/quickshare-cli-py
 
 Any of these puts a `quickshare` command on your `PATH`.
 
+See [Usage](#usage) for how to run it, and [Setup](#setup) if you want to work on the code instead of just installing the command.
+
+## Features
+
+**Receiving**
+- Advertises over mDNS (`_FC9F5ED42C8A._tcp.local.`) so phones on the same
+  LAN/Wi-Fi discover this machine as a Quick Share target
+- PIN-verified consent prompt before accepting a transfer (or `--yes` to
+  auto-accept)
+- Cancel a transfer mid-flight (Ctrl+C on the receiver, or from the sender);
+  either way the partial file is discarded, never left under its real name
+- Stable device identity across restarts (derived from hostname, not MAC,
+  no more re-pairing every time you restart the receiver)
+
+**Sending**
+- Browses mDNS for nearby Quick Share receivers and shows an interactive
+  numbered picker, or connect directly with `--target host:port`
+- Sends one or more files in a single transfer, with a PIN shown for the
+  same confirmation-code check as receiving
+- Interoperates with real Android/ChromeOS/Windows Quick Share receivers,
+  not just this project's own receiver
+
+**Both directions**
+- Full UKEY2 handshake (ECDH P-256 + HKDF-SHA256) and SecureMessage frame
+  encryption (AES-256-CBC + HMAC-SHA256)
+- Live progress bar with percentage (and transfer speed, when receiving)
+- Colored terminal output (`--no-color` to disable)
+
 ## Setup
 
 To work on the code instead:
@@ -68,7 +74,7 @@ uv sync
 
 This installs runtime dependencies (`zeroconf`, `protobuf`, `cryptography`,
 `ifaddr`) and the dev-only `grpcio-tools`, used solely to regenerate the
-protobuf bindings under `src/quickshare/proto/` (already checked in — you
+protobuf bindings under `src/quickshare/proto/` (already checked in, you
 don't need to regenerate them to just run the receiver or sender).
 
 ## Usage
@@ -123,19 +129,19 @@ uv run quickshare send PATH [PATH ...] [-n NAME] [-i IFACE] [-t HOST:PORT] [--no
 
 ## How it works
 
-1. **Discover** — the receiver registers a zeroconf mDNS service under the
+1. **Discover:** the receiver registers a zeroconf mDNS service under the
    Nearby Connections WifiLan service type, with an endpoint-info TXT record
    describing itself (name, device type, endpoint ID); the sender browses for
    that same service type and decodes the instance name/TXT record back into
    a device to connect to.
-2. **Handshake** — over TCP, both sides run UKEY2 with opposite roles
+2. **Handshake:** over TCP, both sides run UKEY2 with opposite roles
    (receiver = server, sender = client): an ephemeral ECDH key exchange
    authenticated by a short PIN the user confirms on both ends, from which
    AES and HMAC keys are derived via HKDF.
-3. **Encrypted frames** — all further communication is wrapped in
+3. **Encrypted frames:** all further communication is wrapped in
    SecureMessage frames (AES-256-CBC + HMAC-SHA256) inside the Nearby
    Connections `OfflineFrame` envelope.
-4. **Sharing protocol** — inside that, the Nearby Sharing layer runs a
+4. **Sharing protocol:** inside that, the Nearby Sharing layer runs a
    paired-key verification round (this project has no contact/certificate
    store, so it always reports "unable to verify" rather than skipping PIN
    confirmation), then the sender offers files via an introduction frame, the
@@ -244,13 +250,13 @@ after regenerating, or the package won't import.
   single connection at a time, then goes back to advertising; the sender
   connects to exactly one target per invocation.
 - **No paired-device/contacts trust.** This project has no certificate store,
-  so paired-key verification always reports "unable to verify" on both sides
-  — every transfer requires the PIN confirmation, there's no silent
+  so paired-key verification always reports "unable to verify" on both sides,
+  every transfer requires the PIN confirmation, there's no silent
   already-trusted fast path.
 - **No Bluetooth.** Real Quick Share uses a BLE advertisement to nudge nearby
   devices into scanning for the mDNS service. Without a Bluetooth adapter,
   the receiver instead periodically re-registers its mDNS advertisement as a
-  compensating workaround — this is original to this project, not something
+  compensating workaround, this is original to this project, not something
   google/nearby's own source does. The sender has no equivalent workaround to
   make (it isn't advertising anything); it just browses whenever invoked.
 
