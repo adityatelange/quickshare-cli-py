@@ -166,6 +166,38 @@ QUICKSHARE_DEBUG=trace quickshare receive   # same as --debug-trace
 An explicit flag always wins over the environment variable. All debug output
 goes to stderr, so it never mixes into anything you pipe on stdout.
 
+### File manager integration (Nemo)
+
+On Cinnamon/Linux Mint, Nemo supports custom right-click actions. Drop these
+into `~/.local/share/nemo/actions/` to get "Quick Share Send" and "Quick
+Share Receive" entries in the context menu:
+
+`~/.local/share/nemo/actions/quickshare_send.nemo_action`:
+
+```ini
+[Nemo Action]
+Name=Quick Share Send
+Comment=Share file via QuickShare
+Exec=gnome-terminal -- bash -c 'quickshare send "$@"; echo; read -p "Press Enter to close..."' _ %F
+Selection=Any
+Extensions=any;
+```
+
+`~/.local/share/nemo/actions/quickshare_receive.nemo_action`:
+
+```ini
+[Nemo Action]
+Name=Quick Share Receive
+Comment=Receive files via Quick Share
+Exec=gnome-terminal -- bash -c 'quickshare receive -o "$1"; echo; read -p "Press Enter to close..."' _ %P
+Selection=Any
+Extensions=any;
+```
+
+"Send" runs on the selected file(s); "Receive" runs on the current folder and
+saves incoming files there. Both keep the terminal open after the transfer so
+you can see the result before it closes.
+
 ## How it works
 
 1. **Discover:** the receiver registers a zeroconf mDNS service under the
