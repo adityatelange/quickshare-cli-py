@@ -296,15 +296,40 @@ SENDER_CANCELED = "sender_canceled"
 
 
 @dataclass
+class IncomingText:
+    """A text/URL/phone/address attachment. Unlike a file, the content arrives
+    as a BYTES payload -- the same payload type the control frames
+    (introduction, paired-key, response) use -- so it can only be told apart
+    from those by its payload_id having been announced in the introduction's
+    text_metadata."""
+
+    payload_id: int
+    title: str
+    type: int
+    size: int
+    body: str = ""
+    # Tracked separately from `body` being non-empty: a sender is free to
+    # share a zero-length text, and testing truthiness would leave that
+    # transfer hanging forever waiting for content that already arrived.
+    received: bool = False
+
+    @property
+    def type_name(self) -> str:
+        return wf_pb2.TextMetadata.Type.Name(self.type)
+
+
+@dataclass
 class ReceiveSession:
     channel: SecureChannel
     output_dir: Path
     pin: str
     auto_accept: bool = False
-    on_offer: Optional[Callable[[list[wf_pb2.FileMetadata], str], bool]] = None
+    on_offer: Optional[Callable[[list[wf_pb2.FileMetadata], str, list[wf_pb2.TextMetadata]], bool]] = None
     on_progress: Optional[Callable[[IncomingFile], None]] = None
+    on_text: Optional[Callable[["IncomingText"], None]] = None
 
     files_by_payload_id: dict = field(default_factory=dict)
+    texts_by_payload_id: dict = field(default_factory=dict)
     _bytes_reassembly: dict = field(default_factory=dict)  # payload_id -> bytearray
     _offer_accepted: bool = field(default=False, repr=False)
 
@@ -346,8 +371,16 @@ class ReceiveSession:
             if chunk.body:
                 buf.extend(chunk.body)
             if is_last:
-                sharing_bytes = bytes(self._bytes_reassembly.pop(header.id))
-                self._handle_sharing_frame(sharing_bytes)
+                payload_bytes = bytes(self._bytes_reassembly.pop(header.id))
+                # A BYTES payload whose id was announced in the introduction's
+                # text_metadata carries the raw text itself, NOT a
+                # sharing_nearby.Frame -- feeding it to ParseFromString is
+                # what used to abort a text transfer with "Wire format was
+                # corrupt".
+                incoming_text = self.texts_by_payload_id.get(header.id)
+                if incoming_text is not None:
+                    return self._handle_text_payload(incoming_text, payload_bytes)
+                self._handle_sharing_frame(payload_bytes)
             return None
 
         if header.type == off_pb2.PayloadTransferFrame.PayloadHeader.PayloadType.FILE:
@@ -380,9 +413,33 @@ class ReceiveSession:
                         f"payload_id={header.id} ended early at {incoming.bytes_written}/{incoming.size} bytes",
                     )
                 self.channel_send(self.channel.encrypt(build_payload_received_ack(header.id, incoming.bytes_written)))
-                if self._offer_accepted and all(f.complete for f in self.files_by_payload_id.values()):
-                    return [f.dest_path for f in self.files_by_payload_id.values()]
+                return self._completion_result()
         return None
+
+    def _handle_text_payload(self, incoming_text: "IncomingText", payload_bytes: bytes) -> Optional[list[Path]]:
+        incoming_text.body = payload_bytes.decode("utf-8", "replace")
+        incoming_text.received = True
+        debug.log(
+            "receive",
+            f"<- TEXT payload_id={incoming_text.payload_id} type={incoming_text.type_name} "
+            f"({len(payload_bytes)} bytes)",
+        )
+        self.channel_send(self.channel.encrypt(build_payload_received_ack(incoming_text.payload_id, len(payload_bytes))))
+        if self.on_text is not None:
+            self.on_text(incoming_text)
+        return self._completion_result()
+
+    def _completion_result(self) -> Optional[list[Path]]:
+        """Non-None once every accepted attachment -- files and texts alike --
+        has arrived, which ends the connection. Texts contribute no paths, so a
+        text-only transfer completes with an empty list (still not None)."""
+        if not self._offer_accepted:
+            return None
+        if not all(f.complete for f in self.files_by_payload_id.values()):
+            return None
+        if not all(t.received for t in self.texts_by_payload_id.values()):
+            return None
+        return [f.dest_path for f in self.files_by_payload_id.values()]
 
     def _handle_sharing_frame(self, sharing_bytes: bytes) -> None:
         frame = wf_pb2.Frame()
@@ -402,9 +459,9 @@ class ReceiveSession:
 
     def _handle_introduction(self, introduction: wf_pb2.IntroductionFrame) -> None:
         if debug.enabled():
-            # meta.name is the sender's raw, unsanitized name -- run it
-            # through color.sanitize before it reaches the terminal, same as
-            # every other display path does (see color.sanitize's docstring).
+            # meta.name/text_title are the sender's raw, unsanitized strings --
+            # run them through color.sanitize before they reach the terminal,
+            # same as every other display path does (see color.sanitize's docstring).
             for meta in introduction.file_metadata:
                 debug.log(
                     "receive",
@@ -412,9 +469,17 @@ class ReceiveSession:
                     f"({meta.size} bytes, payload_id={meta.payload_id}, "
                     f"type={wf_pb2.FileMetadata.Type.Name(meta.type)})",
                 )
+            for meta in introduction.text_metadata:
+                debug.log(
+                    "receive",
+                    f"offered text {color.sanitize(meta.text_title)!r} "
+                    f"({meta.size} bytes, payload_id={meta.payload_id}, "
+                    f"type={wf_pb2.TextMetadata.Type.Name(meta.type)})",
+                )
 
+        texts = list(introduction.text_metadata)
         if self.on_offer is not None:
-            accept = self.on_offer(list(introduction.file_metadata), self.pin)
+            accept = self.on_offer(list(introduction.file_metadata), self.pin, texts)
         else:
             accept = self.auto_accept
 
@@ -428,6 +493,13 @@ class ReceiveSession:
                 incoming = IncomingFile(payload_id=meta.payload_id, name=safe_name, size=meta.size, dest_path=dest)
                 incoming.open()
                 self.files_by_payload_id[meta.payload_id] = incoming
+            for meta in texts:
+                self.texts_by_payload_id[meta.payload_id] = IncomingText(
+                    payload_id=meta.payload_id,
+                    title=meta.text_title,
+                    type=meta.type,
+                    size=meta.size,
+                )
 
         self._send_frames(build_connection_response_frame(accept))
 

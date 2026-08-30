@@ -55,6 +55,17 @@ def sanitize(text: str) -> str:
     return "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf"))
 
 
+def sanitize_multiline(text: str) -> str:
+    """sanitize() for content whose line structure is part of the content
+    itself -- a received text/note, which is printed as the actual output
+    rather than as a label. Same stripping, except newlines and tabs survive,
+    so a multi-line note doesn't collapse onto one line. Escape sequences
+    still go: ESC is Cc but is not \\n or \\t, so the ANSI-injection defense
+    sanitize() provides is unchanged. Carriage return is deliberately NOT
+    preserved -- it would let a peer overwrite an already-printed line."""
+    return "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf"))
+
+
 def _wrap(text: str, *codes: str) -> str:
     if not _ENABLED:
         return text

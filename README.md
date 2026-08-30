@@ -47,6 +47,10 @@ See [Usage](#usage) for how to run it, and [Setup](#setup) if you want to work o
   auto-accept)
 - Cancel a transfer mid-flight (Ctrl+C on the receiver, or from the sender);
   either way the partial file is discarded, never left under its real name
+- Receives shared text as well as files -- a note, link, address or phone
+  number sent from the phone's share sheet is printed to stdout (so
+  `quickshare receive > note.txt` or a pipe captures just the text), while
+  the status output stays on stderr
 - Stable device identity across restarts (derived from hostname, not MAC,
   no more re-pairing every time you restart the receiver)
 

@@ -27,7 +27,14 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 from quickshare import color, debug, framing, mdns, ukey2
 from quickshare.proto import offline_wire_formats_pb2 as off_pb2
-from quickshare.receive import SENDER_CANCELED, IncomingFile, ReceiveSession, build_connection_response_accept
+from quickshare.proto import wire_format_pb2 as wf_pb2
+from quickshare.receive import (
+    SENDER_CANCELED,
+    IncomingFile,
+    IncomingText,
+    ReceiveSession,
+    build_connection_response_accept,
+)
 from quickshare.secure_frame import SecureChannel
 
 REANNOUNCE_INTERVAL_SECONDS = 60.0
@@ -147,6 +154,7 @@ def _handle_connection(
     auto_accept: bool,
     on_offer,
     on_progress,
+    on_text,
 ) -> tuple[str, list[Path] | None]:
     """Returns (outcome, completed_file_paths). completed_file_paths is only
     populated when outcome == TransferOutcome.COMPLETED."""
@@ -167,6 +175,7 @@ def _handle_connection(
             auto_accept=auto_accept,
             on_offer=on_offer,
             on_progress=on_progress,
+            on_text=on_text,
             channel_send=lambda payload: framing.send_frame(sock, payload),
         )
         session.start()
@@ -177,7 +186,7 @@ def _handle_connection(
                     secure_message_bytes = framing.recv_frame(sock)
                 except framing.FrameError as exc:
                     debug.log("server", f"connection ended while reading: {exc}")
-                    if session.files_by_payload_id:
+                    if session.files_by_payload_id or session.texts_by_payload_id:
                         session.discard_incomplete()
                         return TransferOutcome.SENDER_DISCONNECTED, None
                     return TransferOutcome.DECLINED, None
@@ -344,11 +353,29 @@ class _ReceiveProgressPrinter:
 _print_progress = _ReceiveProgressPrinter()
 
 
-def _interactive_confirm(file_metadata: list, pin: str) -> bool:
+def _print_received_text(incoming: IncomingText) -> None:
+    """Text has no file on disk to point at, so the content itself is the
+    result: print it to stdout (not stderr, where the status chatter goes) so
+    `quickshare receive > out.txt` and shell pipelines capture just the text."""
+    kind = incoming.type_name.lower()
+    label = color.sanitize(incoming.title) if incoming.title else f"received {kind}"
+    print(color.green(f"\nReceived {kind}: {label}"), file=sys.stderr)
+    sys.stderr.flush()
+    # The body is untrusted sender-controlled text; sanitize_multiline strips
+    # the escape sequences that would otherwise let it repaint the terminal,
+    # while keeping the newlines that are part of the note itself.
+    print(color.sanitize_multiline(incoming.body), flush=True)
+
+
+def _interactive_confirm(file_metadata: list, pin: str, text_metadata: list | None = None) -> bool:
     print(f"\nIncoming transfer, confirmation code: {color.bold(color.yellow(pin))}", file=sys.stderr)
     print("Confirm this code matches what your phone shows before accepting.", file=sys.stderr)
     for meta in file_metadata:
         print(f"  {color.sanitize(meta.name)}  ({format_size(meta.size)})", file=sys.stderr)
+    for meta in text_metadata or []:
+        kind = wf_pb2.TextMetadata.Type.Name(meta.type).lower()
+        title = color.sanitize(meta.text_title) if meta.text_title else "(untitled)"
+        print(f"  {title}  ({kind}, {format_size(meta.size)})", file=sys.stderr)
     sys.stderr.flush()
     try:
         answer = input("Accept? [y/N] ").strip().lower()
@@ -367,10 +394,13 @@ def run_receiver(
     auto_accept: bool,
     on_offer=None,
     on_progress=None,
+    on_text=None,
 ) -> int:
     print(color.dim("Minimal Quick Share CLI client for Linux\n"), file=sys.stderr)
     if on_progress is None:
         on_progress = _print_progress
+    if on_text is None:
+        on_text = _print_received_text
     if on_offer is None and not auto_accept:
         on_offer = _interactive_confirm
     output_path = Path(output_dir).resolve()
@@ -406,15 +436,23 @@ def run_receiver(
             conn, peer_addr = listener.accept()
             debug.log("server", f"accepted connection from {peer_addr[0]}:{peer_addr[1]}")
             try:
-                outcome, completed = _handle_connection(conn, peer_addr[0], output_path, auto_accept, on_offer, on_progress)
+                outcome, completed = _handle_connection(
+                    conn, peer_addr[0], output_path, auto_accept, on_offer, on_progress, on_text
+                )
                 debug.log("server", f"connection finished, outcome={outcome}")
                 if isinstance(on_progress, _ReceiveProgressPrinter):
                     on_progress.reset()  # close any bar left open by a canceled/disconnected transfer
                 print(file=sys.stderr)  # end whatever progress line was mid-print
                 if outcome == TransferOutcome.COMPLETED:
-                    print(color.green("Transfer finished. Saved:"), file=sys.stderr)
-                    for path in completed:
-                        print(f"  {path}", file=sys.stderr)
+                    # completed is empty for a text-only transfer -- the text
+                    # was already printed by on_text, and there's nothing on
+                    # disk to list, so don't print an empty "Saved:" header.
+                    if completed:
+                        print(color.green("Transfer finished. Saved:"), file=sys.stderr)
+                        for path in completed:
+                            print(f"  {path}", file=sys.stderr)
+                    else:
+                        print(color.green("Transfer finished."), file=sys.stderr)
                 elif outcome == TransferOutcome.DECLINED:
                     print(color.yellow("Transfer declined."), file=sys.stderr)
                 elif outcome == TransferOutcome.CANCELED:
